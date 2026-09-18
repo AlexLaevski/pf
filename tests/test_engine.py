@@ -154,6 +154,25 @@ async def test_halt_cancels_every_quote():
     assert engine.states["BTC"].quote_order is None
 
 
+async def test_resting_quotes_count_against_the_open_notional_cap():
+    engine = build()
+    await engine._tick()
+    state = engine.states["BTC"]
+    assert state.quote_order is not None
+
+    resting = state.quote_order.remaining * state.quote_order.price
+    assert engine._open_notional() == resting, "a resting quote is committed capital"
+
+    # With the cap just under one clip, the quote must be pulled rather than
+    # left out there as an unaccounted promise to buy.
+    engine.risk.cfg = type(engine.risk.cfg)(
+        **{**engine.risk.cfg.__dict__, "max_open_notional_usd": resting / 2}
+    )
+    await engine._tick()
+    assert engine.states["BTC"].quote_order is None
+    assert "max_open_notional_usd" in engine.states["BTC"].last_reason
+
+
 async def test_position_reconciliation_adopts_the_venue():
     engine = build()
     # Someone (or a missed fill) left a long on the maker venue.

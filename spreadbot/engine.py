@@ -783,11 +783,21 @@ class Engine:
                 pair.short_size = venue_short
 
     def _open_notional(self) -> Decimal:
+        """Capital committed: filled longs *plus* everything currently resting.
+
+        A resting quote is a promise to buy. Counting only filled positions is
+        harmless with three markets and dangerous with fifty: one market-wide
+        sweep fills every quote at once, and the cap that was meant to bound
+        the book never saw them coming.
+        """
         total = ZERO
         for symbol, state in self.states.items():
             book = self.hedge_feed.books.get(symbol) or self.maker_feed.books.get(symbol)
             mid = (book.mid if book else None) or ZERO
             total += state.pair.long_size * mid
+            quote = state.quote_order
+            if quote is not None and not quote.is_terminal:
+                total += quote.remaining * quote.price
         return total
 
     # ----------------------------------------------------------------- report
