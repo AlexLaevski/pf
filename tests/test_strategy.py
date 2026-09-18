@@ -199,14 +199,54 @@ def test_bounce_edge_charges_the_maker_fee_twice():
 def test_delayed_mode_enters_on_the_bounce_not_the_hedge_price():
     strat = strategy(hedge={"mode": "delayed"}, bounce={"target": "hole_top"})
     maker_book = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
-    # Hedge venue is BELOW our quote: in immediate mode this would be refused.
-    hedge_book = book([("99.55", "10")], [("99.60", "10")], venue="core")
+    # Hedge is only 1bps above our entry: far too thin for immediate mode's
+    # 3bps bar, but delayed mode is paid by the bounce, not by this spread.
+    hedge_book = book([("99.61", "10")], [("99.62", "10")], venue="core")
     decision = strat.plan_entry(
         "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
     )
     assert decision.ok, decision.reason
     assert decision.plan.bounce_target == D("99.8")
     assert decision.plan.edge_bps > D(19)     # 99.6 -> 99.8 is ~20bps
+
+    immediate = strategy(hedge={"mode": "immediate"})
+    assert not immediate.plan_entry(
+        "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
+    ).ok
+
+
+def test_delayed_mode_refuses_when_the_backstop_starts_underwater():
+    # The audit case: the hedge venue is already 1% below our entry, so the
+    # panic exit fires on the first tick and the loss is locked in before the
+    # bounce ever had a chance. The bounce edge alone must not authorise this.
+    strat = strategy(hedge={"mode": "delayed", "panic_bps": 50})
+    maker_book = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
+    hedge_book = book([("98.60", "10")], [("98.65", "10")], venue="core")
+    decision = strat.plan_entry(
+        "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
+    )
+    assert not decision.ok
+    assert "underwater" in decision.reason
+
+
+def test_entry_adverse_allowance_can_be_loosened():
+    strat = strategy(
+        hedge={"mode": "delayed", "panic_bps": 50, "max_entry_adverse_bps": 20}
+    )
+    maker_book = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
+    hedge_book = book([("99.50", "10")], [("99.55", "10")], venue="core")  # ~10bps under
+    assert strat.plan_entry(
+        "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
+    ).ok
+
+
+def test_entry_allowance_above_panic_is_rejected_by_config():
+    import pytest as _pytest
+
+    from spreadbot.config import ConfigError
+
+    with _pytest.raises(ConfigError, match="max_entry_adverse_bps"):
+        strategy(hedge={"mode": "delayed", "panic_bps": 20, "max_entry_adverse_bps": 30})
 
 
 def test_delayed_mode_still_refuses_when_the_hedge_cannot_absorb_the_clip():

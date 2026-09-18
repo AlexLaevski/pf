@@ -302,12 +302,22 @@ class LighterFeed:
 class StaticFeed:
     """A feed backed by hand-made books. Used by tests and the simulator."""
 
-    def __init__(self, venue_key: str, specs: Dict[str, MarketSpec]) -> None:
+    def __init__(
+        self,
+        venue_key: str,
+        specs: Dict[str, MarketSpec],
+        *,
+        staleness_ms: float = float("inf"),
+    ) -> None:
         self.venue_key = venue_key
         self.specs = specs
         self.books: Dict[str, OrderBook] = {}
         self.updated = asyncio.Event()
         self.transport = "static"
+        # Infinite by default so hand-made books never go stale mid-test; set
+        # it to exercise the staleness paths, which are where a naked position
+        # can otherwise be stranded.
+        self.staleness_ms = staleness_ms
         self._connected = True
 
     @property
@@ -319,7 +329,7 @@ class StaticFeed:
 
     def is_fresh(self, symbol: str) -> bool:
         book = self.books.get(symbol.upper())
-        return bool(book and book.ready)
+        return bool(book and book.ready and book.is_fresh(self.staleness_ms))
 
     async def start(self, symbols: Sequence[str]) -> None:
         for symbol in symbols:

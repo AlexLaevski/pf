@@ -3,12 +3,19 @@
 The SDK is imported lazily: market data, the scanner and paper mode all work
 without it installed.
 
-Fill detection is deliberately belt-and-braces. ``sync_orders`` polls our own
-active orders and turns a drop in ``remaining_base_amount`` into a fill, which
-is the fast path. The authoritative path is position reconciliation in the
-engine, which reads the public ``/account`` endpoint and hedges whatever
-difference it finds. An order that disappears from the active list is *not*
-assumed to be filled — it is marked unknown and left to the reconciler.
+Fill detection is deliberately belt-and-braces, because every millisecond
+between a fill and its hedge is naked risk:
+
+* a drop in ``remaining_base_amount`` on an order still in the active list is
+  a partial fill;
+* an order that has *left* the active list is resolved right there from the
+  inactive-order list — that is how a completed maker fill announces itself,
+  and deferring it to the reconciliation sweep would mean seconds of naked
+  exposure on every entry;
+* whatever both miss is caught by position reconciliation against the public
+  ``/account`` endpoint, which stays the authority. Nothing is ever *assumed*
+  to have filled: an order whose outcome cannot be read is marked unknown and
+  left to the reconciler.
 """
 
 from __future__ import annotations
@@ -164,7 +171,7 @@ class LighterExecution(ExecutionVenue):
             # An IOC never rests, so it will not show up in the active-order
             # poll. Settle it now, or the engine would keep believing the
             # position is unhedged.
-            await self._settle_taker(order)
+            await self._settle_from_inactive(order)
         log.info(
             "%s: placed %s %s %s @ %s (%s%s) coi=%s",
             self.venue_key,
@@ -272,10 +279,15 @@ class LighterExecution(ExecutionVenue):
                 by_coi[coi] = raw
 
         fills: List[Fill] = []
+        vanished: List[Order] = []
         for coi, order in tracked.items():
             raw = by_coi.get(coi)
             if raw is None:
-                order.error = "not in active orders; awaiting position reconciliation"
+                # A fully filled order is removed from the active list, so this
+                # is the normal way a maker fill announces itself. Waiting for
+                # the 5s position reconciliation here would mean seconds of
+                # naked exposure on every entry.
+                vanished.append(order)
                 continue
             if order.order_index is None:
                 order.order_index = _int_or_none(getattr(raw, "order_index", None))
@@ -316,12 +328,35 @@ class LighterExecution(ExecutionVenue):
                 price,
                 coi,
             )
+
+        for order in vanished:
+            before = order.filled_size
+            await self._settle_from_inactive(order, attempts=3, delay=0.1)
+            if order.filled_size > before:
+                fills.append(
+                    Fill(
+                        venue=self.venue_key,
+                        symbol=order.symbol,
+                        side=order.side,
+                        price=order.avg_fill_price,
+                        size=order.filled_size - before,
+                        order_index=order.order_index,
+                        client_order_index=order.client_order_index,
+                        is_maker=order.order_type is OrderType.POST_ONLY,
+                    )
+                )
         return fills
 
-    async def _settle_taker(
+    async def _settle_from_inactive(
         self, order: Order, *, attempts: int = 8, delay: float = 0.15
     ) -> None:
-        """Resolve an IOC/market order's outcome from the inactive-order list."""
+        """Resolve an order's final outcome from the inactive-order list.
+
+        Used for two cases that look the same to the API: an IOC that never
+        rested, and a resting order that has left the active list because it
+        filled. Both need an answer now — the alternative is carrying the
+        position as unhedged until the next reconciliation sweep.
+        """
         if self._order_api is None:
             return
         spec = self.spec(order.symbol)
@@ -363,13 +398,13 @@ class LighterExecution(ExecutionVenue):
                     self._emit_fill(fill)
                 if filled <= ZERO:
                     order.status = OrderStatus.CANCELED
-                    order.error = "IOC expired unfilled"
+                    order.error = "left the book unfilled"
                 return
             await asyncio.sleep(delay)
 
-        order.error = "taker order outcome unknown; left to position reconciliation"
+        order.error = "outcome unknown; left to position reconciliation"
         log.error(
-            "%s: could not settle taker order coi=%s - reconciliation will pick it up",
+            "%s: could not settle order coi=%s - reconciliation will pick it up",
             self.venue_key,
             order.client_order_index,
         )

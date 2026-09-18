@@ -115,9 +115,25 @@ class Hedger:
                     order.avg_fill_price,
                 )
                 return TakerResult(order.filled_size, order.avg_fill_price, 1)
+
             with contextlib.suppress(Exception):
                 await self.venue.cancel(order)
+            # The order can fill in the instant between the last poll and the
+            # cancel landing. Re-reading the outcome after cancelling is what
+            # stops us taking the full remainder on top of a maker fill that
+            # already happened, and ending up hedged twice.
+            with contextlib.suppress(Exception):
+                await self.venue.refresh(symbol)
             self.venue.forget(order)
+            if order.remaining <= ZERO:
+                log.info(
+                    "%s: %s filled as maker during cancel (%s @ %s); nothing left to take",
+                    self.venue.venue_key,
+                    tag,
+                    order.filled_size,
+                    order.avg_fill_price,
+                )
+                return TakerResult(order.filled_size, order.avg_fill_price, 1)
 
         filled_as_maker = order.filled_size if order is not None else ZERO
         remaining = size - filled_as_maker

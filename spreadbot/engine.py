@@ -146,6 +146,10 @@ class Engine:
         self._last_reconcile = 0.0
         self._last_rotation = 0.0
         self._last_funding = 0.0
+        # One lock per market keeps a tick from re-entering itself mid-hedge;
+        # the shared quote lock keeps the notional cap honest across markets.
+        self._market_locks: Dict[str, asyncio.Lock] = {}
+        self._quote_lock = asyncio.Lock()
         # Extra resources (REST sessions) to release on shutdown.
         self.closeables: List[object] = []
 
@@ -237,40 +241,77 @@ class Engine:
                 log.exception("rotation failed")
                 self.risk.note_error(f"rotation: {exc}")
 
+        # Markets tick concurrently. A hedge can take a second or more - retries,
+        # a maker leg waiting in the queue - and running markets in sequence
+        # meant one slow hedge delayed every other market's hedge behind it.
         # The rotation above can add and remove markets, so iterate a snapshot.
-        for symbol, state in list(self.states.items()):
+        await asyncio.gather(
+            *(self._tick_market_guarded(symbol, state, now) for symbol, state in list(self.states.items()))
+        )
+
+        if self.risk.halted:
+            await self._cancel_all_quotes("risk halted")
+
+    async def _tick_market_guarded(self, symbol: str, state: MarketState, now: float) -> None:
+        """One market's tick, serialised against itself and never fatal.
+
+        The per-market lock matters: a tick that is still hedging must not be
+        re-entered by the next tick and end up sending the hedge twice.
+        """
+        lock = self._market_locks.setdefault(symbol, asyncio.Lock())
+        if lock.locked():
+            # Still busy with the previous tick - almost always a hedge in
+            # flight. Skipping is correct; queueing would just pile up.
+            return
+        async with lock:
             try:
                 await self._tick_market(symbol, state, now)
             except Exception as exc:
                 log.exception("%s: tick failed", symbol)
                 self.risk.note_error(f"{symbol}: {exc}")
 
-        if self.risk.halted:
-            await self._cancel_all_quotes("risk halted")
-
     async def _tick_market(self, symbol: str, state: MarketState, now: float) -> None:
         maker_book = self.maker_feed.books.get(symbol)
         hedge_book = self.hedge_feed.books.get(symbol)
         if maker_book is None or hedge_book is None:
             return
-        fresh = self.maker_feed.is_fresh(symbol) and self.hedge_feed.is_fresh(symbol)
-        if not fresh:
-            await self._cancel_quote(state, "stale book")
-            state.last_reason = "stale book"
-            return
-
+        maker_fresh = self.maker_feed.is_fresh(symbol)
+        hedge_fresh = self.hedge_feed.is_fresh(symbol)
         mark = hedge_book.mid or maker_book.mid or ZERO
-        state.vol.update(now, maker_book.mid)
+        if maker_fresh:
+            state.vol.update(now, maker_book.mid)
 
-        # 1. Unhedged exposure. In immediate mode this is an emergency and the
-        # hedge fires now. In delayed mode it is the trade: we hold the naked
-        # long for a volatility-scaled window, hoping the sweep reverts, and
-        # only hedge when that window closes or the price runs away from us.
+        # 1. Unhedged exposure is handled FIRST and regardless of staleness.
+        # Skipping the tick because a feed lagged is how a naked position ends
+        # up with neither a hedge nor a stop: the lag and the move that caused
+        # the fill are the same event.
         if state.pair.unhedged > ZERO:
+            if not hedge_fresh:
+                # We cannot price the hedge, so we cannot send it - but we must
+                # not pretend nothing is wrong either.
+                breach = self.risk.unhedged_breach(state.pair, mark, now=now)
+                message = (
+                    f"{symbol}: {state.pair.unhedged} unhedged while the "
+                    f"{self.hedge_exec.venue_key} book is stale "
+                    f"({hedge_book.age_ms(now):.0f}ms old)"
+                )
+                self.risk.note_error(message)
+                if breach:
+                    self.risk.halt(f"{message} - {breach}")
+                    await self._cancel_all_quotes("cannot hedge on a stale book")
+                state.last_reason = "unhedged, hedge book stale"
+                return
             if self.cfg.hedge.is_delayed and state.pair.short_size <= ZERO:
-                await self._manage_naked(state, maker_book, hedge_book, mark, now)
+                await self._manage_naked(
+                    state, maker_book, hedge_book, mark, now, maker_fresh=maker_fresh
+                )
             else:
                 await self._hedge(state, hedge_book, mark, now, reason="unhedged fill")
+            return
+
+        if not (maker_fresh and hedge_fresh):
+            await self._cancel_quote(state, "stale book")
+            state.last_reason = "stale book"
             return
 
         # The scalp is over: either the bounce closed it or the hedge landed.
@@ -330,6 +371,8 @@ class Engine:
         hedge_book: OrderBook,
         mark: Decimal,
         now: float,
+        *,
+        maker_fresh: bool = True,
     ) -> None:
         """Hold the unhedged long while the bounce still has a chance."""
         pair = state.pair
@@ -349,7 +392,11 @@ class Engine:
                 state.naked_window,
             )
 
-        await self._rest_bounce_order(state, maker_spec)
+        # The take-profit is priced off the maker book, so a stale one means we
+        # wait rather than quote into the dark. The panic and timeout checks
+        # below still run: those are what bound the risk.
+        if maker_fresh:
+            await self._rest_bounce_order(state, maker_spec)
 
         # What we could hedge at right now decides both the bail-out and the
         # bookkeeping, so it is worth the walk down the book.
@@ -618,6 +665,10 @@ class Engine:
         maker_spec = self.maker_specs[symbol]
         hedge_spec = self.hedge_specs[symbol]
 
+        # Should we be quoting here at all? This also pulls a quote that is
+        # already resting when the limits tighten under it. It is deliberately
+        # conservative (it prices a full extra clip on top of what is already
+        # committed); the authoritative check is the atomic one below.
         allowed, reason = self.risk.can_open(
             state.pair,
             mark=mark or maker_book.mid or ZERO,
@@ -651,21 +702,38 @@ class Engine:
         ):
             return
 
-        await self._cancel_quote(state, "repricing")
-        try:
-            order = await self.maker_exec.place(
-                OrderRequest(
-                    symbol=symbol,
-                    side=Side.BUY,
-                    size=plan.size,
-                    price=plan.quote.price,
-                    order_type=OrderType.POST_ONLY,
-                    tag="entry",
-                )
+        # Markets tick concurrently, so the capacity check and the order that
+        # consumes that capacity have to be one atomic step. Otherwise every
+        # market can pass the same check at the same moment and the book ends
+        # up several clips over the cap.
+        async with self._quote_lock:
+            allowed, reason = self.risk.can_open(
+                state.pair,
+                mark=mark or maker_book.mid or ZERO,
+                clip_base=plan.size,
+                max_position_base=market.max_position_base,
+                total_open_notional=self._open_notional(),
             )
-        except Exception as exc:
-            self.risk.note_error(f"{symbol}: quote placement failed: {exc}")
-            return
+            if not allowed:
+                await self._cancel_quote(state, reason)
+                state.last_reason = reason
+                return
+
+            await self._cancel_quote(state, "repricing")
+            try:
+                order = await self.maker_exec.place(
+                    OrderRequest(
+                        symbol=symbol,
+                        side=Side.BUY,
+                        size=plan.size,
+                        price=plan.quote.price,
+                        order_type=OrderType.POST_ONLY,
+                        tag="entry",
+                    )
+                )
+            except Exception as exc:
+                self.risk.note_error(f"{symbol}: quote placement failed: {exc}")
+                return
 
         if order.status.value == "rejected":
             log.debug("%s: quote rejected (%s)", symbol, order.error)

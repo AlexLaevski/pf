@@ -162,6 +162,14 @@ class GapConfig:
     join_offset_ticks: int = 1
     max_distance_from_mid_bps: Decimal = Decimal(50)
     min_wall_levels: int = 1
+    # A multi-level wall has to be an actual wall: levels tens of bps apart are
+    # not one block of liquidity, they are separate levels that happen to add
+    # up. Ignored when min_wall_levels is 1.
+    max_wall_span_bps: Decimal = Decimal(10)
+    # A candidate at the touch is not the trade this bot is built on: quoting a
+    # tick above the best bid makes us the top of book, alone, with no wall
+    # underneath to stop the sweep that fills us.
+    allow_touch_improving: bool = False
     # Liquidity resting at better prices than our quote. A sweep has to clear
     # all of it before it reaches us, so this is the fill-probability dial:
     # None means "don't care", which on a deep book means we rarely get hit.
@@ -186,6 +194,8 @@ class GapConfig:
                 d.get("max_distance_from_mid_bps", 50), "gap.max_distance_from_mid_bps"
             ),
             min_wall_levels=int(d.get("min_wall_levels", 1)),
+            max_wall_span_bps=_dec(d.get("max_wall_span_bps", 10), "gap.max_wall_span_bps"),
+            allow_touch_improving=bool(d.get("allow_touch_improving", False)),
         )
 
 
@@ -236,6 +246,11 @@ class HedgeConfig:
     reference_vol_bps_per_min: Decimal = Decimal(25)
     vol_window_seconds: Decimal = Decimal(180)
     panic_bps: Decimal = Decimal(50)
+    # How far below our entry the hedge price may already be when we enter.
+    # Zero means the backstop must be at least break-even at the moment of the
+    # fill: entering when the hedge venue is already lower is entering a trade
+    # whose panic exit is guaranteed to be a loss.
+    max_entry_adverse_bps: Decimal = Decimal(0)
     maker_first: bool = False
     maker_timeout_ms: int = 1_200
     maker_offset_ticks: int = 0
@@ -260,6 +275,9 @@ class HedgeConfig:
             ),
             vol_window_seconds=_dec(d.get("vol_window_seconds", 180), "hedge.vol_window_seconds"),
             panic_bps=_dec(d.get("panic_bps", 50), "hedge.panic_bps"),
+            max_entry_adverse_bps=_dec(
+                d.get("max_entry_adverse_bps", 0), "hedge.max_entry_adverse_bps"
+            ),
             # Maker-first is the natural pairing for the delayed hedge, where a
             # second of queue time is cheap. In immediate mode the whole point
             # is to lock the spread at once, so there it stays off by default.
@@ -277,6 +295,11 @@ class HedgeConfig:
             raise ConfigError(
                 "hedge.panic_bps must be > 0 in delayed mode: it is the only bound "
                 "on how far the naked leg can run against you"
+            )
+        if cfg.max_entry_adverse_bps >= cfg.panic_bps and cfg.is_delayed:
+            raise ConfigError(
+                "hedge.max_entry_adverse_bps must be below hedge.panic_bps, otherwise "
+                "an entry is allowed that panics out on its very first tick"
             )
         return cfg
 

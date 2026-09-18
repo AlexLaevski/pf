@@ -222,6 +222,21 @@ class SpreadStrategy:
                 if delayed
                 else None
             )
+            if delayed:
+                # The scalp is only survivable because the hedge is there if
+                # the bounce does not come. If the hedge venue is ALREADY below
+                # our entry, that backstop starts underwater: panic_bps fires
+                # on the first tick and the trade is a guaranteed loss before
+                # the bounce ever had a chance.
+                adverse = self.adverse_bps(candidate.price, hedge_price)
+                if adverse > self.cfg.hedge.max_entry_adverse_bps:
+                    blocked = (
+                        f"hedge venue already {adverse:.1f}bps below the entry "
+                        f"(limit {self.cfg.hedge.max_entry_adverse_bps}bps): the backstop "
+                        f"would start underwater"
+                    )
+                    continue
+
             edge = (
                 self.bounce_edge_bps(candidate.price, target, maker_spec)
                 if delayed

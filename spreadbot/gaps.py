@@ -110,7 +110,18 @@ def find_wall_candidates(
     candidates: List[WallCandidate] = []
 
     for index in range(len(levels) - cluster_n + 1):
+        # A quote at the touch has no wall under it - it simply becomes the
+        # best price, alone, which is a different (and unprotected) trade.
+        if index == 0 and not cfg.allow_touch_improving:
+            continue
+
         cluster = levels[index : index + cluster_n]
+        if cluster_n > 1:
+            span = abs(cluster[0].price - cluster[-1].price) / mid * Decimal(10_000)
+            if span > cfg.max_wall_span_bps:
+                # Levels this far apart are not one block of liquidity; summing
+                # them would invent a wall that nothing would actually stop at.
+                continue
         cluster_notional = sum((lvl.notional for lvl in cluster), ZERO)
 
         is_dense = cluster_notional >= cfg.wall_notional_usd and (

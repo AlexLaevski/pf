@@ -29,6 +29,10 @@ class RiskState:
     consecutive_errors: int = 0
     halted: bool = False
     halt_reason: str = ""
+    # A daily loss limit is by definition daily and clears at the day roll.
+    # Everything else (a failed hedge, a position on the forbidden side) is a
+    # statement about the world that a new calendar day does not change.
+    halt_kind: str = ""
     day: str = field(default_factory=lambda: time.strftime("%Y-%m-%d"))
 
     @property
@@ -46,29 +50,38 @@ class RiskManager:
 
     @property
     def halted(self) -> bool:
+        # Checked here rather than only when P&L is booked: a halt stops
+        # trading, trading is what books P&L, so a roll driven by P&L alone
+        # would never come and the halt would be permanent.
+        self._roll_day()
         if self.state.halted:
             return True
         if self.cfg.kill_switch_file and Path(self.cfg.kill_switch_file).exists():
-            self.halt(f"kill switch file present: {self.cfg.kill_switch_file}")
+            self.halt(f"kill switch file present: {self.cfg.kill_switch_file}", kind="kill_switch")
             return True
         return False
 
-    def halt(self, reason: str) -> None:
+    def halt(self, reason: str, *, kind: str = "manual") -> None:
         if not self.state.halted:
             log.error("HALT: %s", reason)
         self.state.halted = True
         self.state.halt_reason = reason
+        self.state.halt_kind = kind
 
     def resume(self) -> None:
         self.state.halted = False
         self.state.halt_reason = ""
+        self.state.halt_kind = ""
         self.state.consecutive_errors = 0
 
     def note_error(self, what: str) -> None:
         self.state.consecutive_errors += 1
         log.warning("error %d/%d: %s", self.state.consecutive_errors, self.cfg.max_consecutive_errors, what)
         if self.state.consecutive_errors >= self.cfg.max_consecutive_errors:
-            self.halt(f"{self.state.consecutive_errors} consecutive errors, last: {what}")
+            self.halt(
+                f"{self.state.consecutive_errors} consecutive errors, last: {what}",
+                kind="errors",
+            )
 
     def note_ok(self) -> None:
         self.state.consecutive_errors = 0
@@ -78,15 +91,32 @@ class RiskManager:
         self.state.realized_pnl += realized
         self.state.fees_paid += fees
         if self.state.net_pnl <= -self.cfg.max_daily_loss_usd:
-            self.halt(f"daily loss limit hit ({self.state.net_pnl:.2f} USD)")
+            self.halt(
+                f"daily loss limit hit ({self.state.net_pnl:.2f} USD)", kind="daily_loss"
+            )
 
     def _roll_day(self) -> None:
         today = time.strftime("%Y-%m-%d")
-        if today != self.state.day:
-            log.info(
-                "new trading day %s; previous day net P&L %.2f USD", today, self.state.net_pnl
+        if today == self.state.day:
+            return
+        log.info("new trading day %s; previous day net P&L %.2f USD", today, self.state.net_pnl)
+
+        # A daily loss halt expires with the day it belongs to. Any other halt
+        # describes something still true, so it survives the roll and stays for
+        # a human to clear.
+        if self.state.halted and self.state.halt_kind == "daily_loss":
+            log.warning(
+                "daily loss halt from %s cleared by the day roll; trading resumes",
+                self.state.day,
             )
-            self.state = RiskState(day=today, halted=self.state.halted, halt_reason=self.state.halt_reason)
+            self.state = RiskState(day=today)
+        else:
+            self.state = RiskState(
+                day=today,
+                halted=self.state.halted,
+                halt_reason=self.state.halt_reason,
+                halt_kind=self.state.halt_kind,
+            )
 
     # ----------------------------------------------------------------- limits
 
