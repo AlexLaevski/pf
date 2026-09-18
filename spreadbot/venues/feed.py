@@ -20,11 +20,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from ..book import OrderBook
 from ..config import FeedConfig
 from ..models import ZERO, MarketSpec
-from .rest import LighterRest
+from .rest import LighterRateLimited, LighterRest
 
 log = logging.getLogger(__name__)
 
 WS_FAILURES_BEFORE_FALLBACK = 3
+REST_MAX_INTERVAL_SECONDS = 30.0
+REST_INTERVAL_DECAY = 0.8
 
 
 def _levels(raw: Iterable[Dict[str, Any]]) -> List[Tuple[Decimal, Decimal]]:
@@ -212,21 +214,48 @@ class LighterFeed:
             return None
 
     async def _run_rest(self) -> None:
-        interval = max(0.05, self.config.rest_poll_ms / 1_000)
+        base_interval = max(0.05, self.config.rest_poll_ms / 1_000)
+        interval = base_interval
         limit = max(50, self.config.depth_levels * 5)
         self._connected = True
         while not self._stop.is_set() and self.transport == "rest":
             started = time.monotonic()
+            throttled = False
+            failures: List[str] = []
             for symbol, book in self.books.items():
                 try:
                     bids, asks = await self.rest.order_book_levels(
                         self.specs[symbol].market_id, limit=limit
                     )
+                except LighterRateLimited:
+                    throttled = True
+                    break
                 except Exception as exc:
-                    log.warning("%s:%s REST book poll failed: %s", self.venue_key, symbol, exc)
+                    failures.append(f"{symbol}: {exc}")
                     continue
                 book.apply_snapshot(bids, asks)
-            self.updated.set()
+
+            if throttled:
+                # Back off the whole loop, not just this request: the limit is
+                # per client, so retrying market by market only digs deeper.
+                interval = min(REST_MAX_INTERVAL_SECONDS, max(interval, base_interval) * 2)
+                log.warning(
+                    "%s: rate limited, slowing book polling to %.1fs", self.venue_key, interval
+                )
+            else:
+                if failures:
+                    # One line per cycle rather than one per market.
+                    log.warning(
+                        "%s: %d/%d book polls failed (%s)",
+                        self.venue_key,
+                        len(failures),
+                        len(self.books),
+                        "; ".join(failures[:3]),
+                    )
+                if interval > base_interval:
+                    interval = max(base_interval, interval * REST_INTERVAL_DECAY)
+                self.updated.set()
+
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.0, interval - elapsed))
         self._connected = False

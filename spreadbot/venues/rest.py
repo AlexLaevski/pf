@@ -8,6 +8,7 @@ but ``aiohttp`` installed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +21,9 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
+# orderBookOrders rejects anything above 250 with a bare "invalid param".
+MAX_ORDER_LIMIT = 250
+
 
 class LighterApiError(RuntimeError):
     def __init__(self, endpoint: str, code: Any, message: str) -> None:
@@ -27,6 +31,14 @@ class LighterApiError(RuntimeError):
         self.endpoint = endpoint
         self.code = code
         self.message = message
+
+
+class LighterRateLimited(LighterApiError):
+    """HTTP 429. Callers are expected to slow down, not just retry harder."""
+
+    def __init__(self, endpoint: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(endpoint, 429, "Too Many Requests")
+        self.retry_after = retry_after
 
 
 def _dec(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -68,9 +80,30 @@ class LighterRest:
         for attempt in range(retries):
             try:
                 async with self._session.get(url, params=params) as resp:
-                    body = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    raise LighterApiError(path, resp.status, str(body)[:200])
+                    status = resp.status
+                    retry_after = _retry_after(resp.headers.get("Retry-After"))
+                    text = await resp.text()
+
+                if status == 429:
+                    # Retrying at the same rate is how a bot blinds itself
+                    # exactly when the market is busiest. Back off, and tell the
+                    # caller so it can slow its whole loop down.
+                    if attempt == retries - 1:
+                        raise LighterRateLimited(path, retry_after)
+                    await asyncio.sleep(retry_after or 0.5 * (2**attempt))
+                    continue
+
+                try:
+                    body = json.loads(text)
+                except ValueError:
+                    # An HTML error page or an empty body: report the status,
+                    # not a JSON parse error two layers from the cause.
+                    raise LighterApiError(
+                        path, status, f"non-JSON response: {text[:160]!r}"
+                    ) from None
+
+                if status >= 400 or not isinstance(body, dict):
+                    raise LighterApiError(path, status, str(body)[:200])
                 code = body.get("code")
                 # 200 on the REST envelope; some endpoints omit the field entirely.
                 if code not in (None, 200, 0):
@@ -127,8 +160,11 @@ class LighterRest:
         """Aggregate the raw order list into price levels.
 
         Returns ``(bids, asks)`` as ``(price, size)`` pairs, bids descending and
-        asks ascending.
+        asks ascending. ``limit`` counts orders per side, not price levels, and
+        the endpoint rejects anything above ``MAX_ORDER_LIMIT`` outright, so it
+        is clamped rather than passed through.
         """
+        limit = max(1, min(MAX_ORDER_LIMIT, limit))
         body = await self._get("orderBookOrders", {"market_id": market_id, "limit": limit})
         return _aggregate(body.get("bids", [])), _aggregate(body.get("asks", []), ascending=True)
 
@@ -161,6 +197,16 @@ class LighterRest:
     async def collateral(self, account_index: int) -> Decimal:
         account = await self.account_state(account_index)
         return _dec(account.get("collateral"))
+
+
+def _retry_after(header: Optional[str]) -> Optional[float]:
+    """Seconds from a Retry-After header, when it carries a usable number."""
+    if not header:
+        return None
+    try:
+        return max(0.0, float(header))
+    except ValueError:
+        return None
 
 
 def _aggregate(orders: List[Dict[str, Any]], *, ascending: bool = False) -> List[Tuple[Decimal, Decimal]]:
