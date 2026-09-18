@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Refuse commits that carry secrets or a real config.
+#
+#   git config core.hooksPath .githooks
+#
+# Bypass with --no-verify only if you are certain; the point of this hook is
+# that a key committed once is a key that must be rotated, private repo or not.
+set -euo pipefail
+
+fail() { echo "pre-commit: $*" >&2; exit 1; }
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[[ -z "$staged" ]] && exit 0
+
+for path in $staged; do
+    case "$path" in
+        config/config.yaml|*.env|.env|*/secrets*|*.pem|*.key)
+            fail "refusing to commit $path - it belongs outside the repository" ;;
+    esac
+done
+
+# Only added lines matter; an existing false positive should not block work.
+added=$(git diff --cached --unified=0 -- $staged | grep '^+' | grep -v '^+++' || true)
+[[ -z "$added" ]] && exit 0
+
+check() {
+    if echo "$added" | grep -qE "$1"; then
+        fail "$2 (use --no-verify only if this is a false positive)"
+    fi
+}
+
+check '0x[a-fA-F0-9]{40,}'                        "a hex value long enough to be a private key"
+check 'BEGIN [A-Z ]*PRIVATE KEY'                  "a PEM private key"
+check '(private_key|api_secret|PRIVATE_KEY)[[:space:]]*[=:][[:space:]]*["'"'"'][^"'"'"'${]'  "a hard-coded private key"
+
+exit 0

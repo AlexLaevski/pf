@@ -132,6 +132,31 @@ bounce:
   target_bps: 20               # used when target: fixed_bps
   min_target_bps: 3            # floor, so a narrow hole cannot collapse onto the entry
 
+# Фандинг — реальная стоимость удержания, и на горячем токене он съедает эдж
+# целиком. Мы в лонге на maker-площадке и в шорте на hedge, поэтому платим
+# разницу ставок. При 6 bps/час пятнадцать минут удержания стоят 1.5 bps.
+funding:
+  enabled: true
+  expected_hold_minutes: 10    # сколько в среднем держим позицию
+  max_cost_bps: 5              # рынок пропускается, если фандинг дороже этого
+  refresh_seconds: 300
+
+# Ротация рынков. Узкое место стратегии — ВРЕМЯ В РЫНКЕ: котировку могут взять
+# только пока она стоит, а стоять она может только там, где в стакане дырка.
+# Фиксированная горстка рынков означает простой большую часть дня.
+#
+# Рынок с открытой позицией или живым ордером никогда не ротируется наружу,
+# а всё, что выводится, сначала зачищается через cancel_all.
+rotation:
+  enabled: false               # включать после того, как measure покажет эдж
+  interval_seconds: 900
+  watch: 12                    # сколько рынков держать одновременно
+  max_churn: 4                 # не больше N замен за круг, чтобы не метаться
+  clip_usd: 50                 # размер клипа для новых рынков
+  min_volume_usd: 50000
+  max_volume_usd: 500000000
+  scan_delay_ms: 120           # пауза между запросами при скане
+
 risk:
   max_open_notional_usd: 2000
   # Hard ceiling on naked exposure. Applies in BOTH modes and overrides the

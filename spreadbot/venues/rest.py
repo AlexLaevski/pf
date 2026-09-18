@@ -168,6 +168,23 @@ class LighterRest:
         body = await self._get("orderBookOrders", {"market_id": market_id, "limit": limit})
         return _aggregate(body.get("bids", [])), _aggregate(body.get("asks", []), ascending=True)
 
+    async def funding_rates(self, exchange: str = "lighter") -> Dict[str, Decimal]:
+        """Current hourly funding rate per symbol, as a fraction of notional.
+
+        Positive means longs pay shorts. The endpoint reports several venues;
+        ``exchange`` picks this deployment's own numbers.
+        """
+        body = await self._get("funding-rates")
+        out: Dict[str, Decimal] = {}
+        for entry in body.get("funding_rates", []):
+            if str(entry.get("exchange", "")).lower() != exchange.lower():
+                continue
+            rate = entry.get("rate")
+            if rate is None:
+                continue
+            out[str(entry["symbol"]).upper()] = _dec(rate)
+        return out
+
     # ----------------------------------------------------------------- account
 
     async def account_state(self, account_index: int) -> Dict[str, Any]:

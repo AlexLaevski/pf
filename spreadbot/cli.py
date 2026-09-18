@@ -21,6 +21,7 @@ import signal
 import sys
 import time
 from decimal import Decimal
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 from .book import OrderBook
@@ -407,6 +408,107 @@ async def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_preflight(args: argparse.Namespace) -> int:
+    """Everything that must be true before real money moves. Places no orders."""
+    cfg = load_config(args.config)
+    setup_logging(cfg.log_level, args.logfile)
+    problems: List[str] = []
+    warnings: List[str] = []
+
+    print(f"режим          : {cfg.mode}")
+    print(f"хедж           : {cfg.hedge.mode}"
+          + (f", окно {cfg.hedge.min_seconds}-{cfg.hedge.max_seconds}с, "
+             f"аварийный выход {cfg.hedge.panic_bps}bps" if cfg.hedge.is_delayed else ""))
+    print(f"ротация        : {'вкл, ' + str(cfg.rotation.watch) + ' рынков' if cfg.rotation.enabled else 'выкл'}")
+    print(f"рынков сейчас  : {len(cfg.markets)}")
+
+    if cfg.hedge.is_delayed:
+        warnings.append(
+            "delayed: в окне ожидания позиция ГОЛАЯ. panic_bps ограничивает глубину, "
+            "но не отменяет уже случившийся убыток"
+        )
+
+    for venue_cfg in (cfg.maker_venue, cfg.hedge_venue):
+        label = f"{venue_cfg.key} ({venue_cfg.allowed_side.value}-only)"
+        try:
+            async with LighterRest(venue_cfg.base_url, venue=venue_cfg.key) as rest:
+                specs = await rest.market_specs()
+                missing = [m.symbol for m in cfg.markets if m.symbol not in specs]
+                if missing:
+                    problems.append(f"{venue_cfg.key}: нет рынков {', '.join(missing)}")
+
+                for market in cfg.markets:
+                    spec = specs.get(market.symbol)
+                    if spec is None:
+                        continue
+                    if market.order_base < spec.min_base_amount:
+                        problems.append(
+                            f"{venue_cfg.key}:{market.symbol} order_base {market.order_base} "
+                            f"ниже минимума {spec.min_base_amount}"
+                        )
+
+                if venue_cfg.account_index is None:
+                    problems.append(f"{venue_cfg.key}: не задан account_index")
+                else:
+                    account = await rest.account_state(venue_cfg.account_index)
+                    collateral = Decimal(str(account.get("collateral", 0)))
+                    available = Decimal(str(account.get("available_balance", 0)))
+                    print(
+                        f"{label:<28}: коллатерал {collateral:.2f}, "
+                        f"свободно {available:.2f}, {len(specs)} рынков"
+                    )
+                    if collateral <= 0:
+                        problems.append(f"{venue_cfg.key}: на аккаунте нет средств")
+                    elif available < cfg.risk.max_open_notional_usd / 10:
+                        warnings.append(
+                            f"{venue_cfg.key}: свободно {available:.0f} при лимите "
+                            f"max_open_notional_usd {cfg.risk.max_open_notional_usd}"
+                        )
+                    # Positions on the forbidden side would halt the bot at once.
+                    for entry in account.get("positions", []):
+                        size = Decimal(str(entry.get("position", 0)))
+                        if size == 0:
+                            continue
+                        sign = int(entry.get("sign", 1))
+                        wrong = (
+                            venue_cfg.allowed_side is Side.BUY and sign < 0
+                        ) or (venue_cfg.allowed_side is Side.SELL and sign > 0)
+                        if wrong:
+                            problems.append(
+                                f"{venue_cfg.key}: уже есть позиция на запрещённой стороне "
+                                f"({entry.get('symbol')} {'short' if sign < 0 else 'long'} {size})"
+                            )
+        except Exception as exc:
+            problems.append(f"{venue_cfg.key}: не отвечает {venue_cfg.base_url}: {exc}")
+            continue
+
+        if cfg.is_live:
+            if venue_cfg.private_key is None:
+                problems.append(
+                    f"{venue_cfg.key}: live-режим, но {venue_cfg.private_key_env} не задан"
+                )
+            else:
+                print(f"{venue_cfg.key:<28}: ключ из {venue_cfg.private_key_env} найден")
+
+    if cfg.risk.kill_switch_file:
+        switch = Path(cfg.risk.kill_switch_file)
+        print(f"kill switch    : {switch} ({'АКТИВЕН' if switch.exists() else 'свободен'})")
+        if switch.exists():
+            warnings.append("kill switch активен - бот не откроет ни одной новой позиции")
+        elif not switch.parent.exists():
+            problems.append(f"каталог для kill switch не существует: {switch.parent}")
+
+    for warning in warnings:
+        print(f"\n[!] {warning}")
+    if problems:
+        print("\nблокирует запуск:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 1
+    print("\nпроверки пройдены" + (" (но прочитай предупреждения выше)" if warnings else ""))
+    return 0
+
+
 async def cmd_validate(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     print(f"mode           : {cfg.mode}")
@@ -527,6 +629,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--paper", action="store_true", help="force paper mode")
     p_run.add_argument("--yes", action="store_true", help="skip the live-trading confirmation")
     p_run.set_defaults(func=cmd_run)
+
+    p_preflight = sub.add_parser(
+        "preflight", help="pre-launch checks: keys, balances, minimums, positions"
+    )
+    p_preflight.add_argument("-c", "--config", required=True)
+    p_preflight.set_defaults(func=cmd_preflight)
 
     p_validate = sub.add_parser("validate", help="check config and venue reachability")
     p_validate.add_argument("-c", "--config", required=True)

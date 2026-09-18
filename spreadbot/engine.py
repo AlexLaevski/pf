@@ -22,7 +22,7 @@ from decimal import Decimal
 from typing import Dict, List, Optional
 
 from .book import OrderBook
-from .config import Config
+from .config import Config, MarketConfig
 from .hedger import Hedger
 from .models import (
     ZERO,
@@ -36,6 +36,7 @@ from .models import (
     Side,
 )
 from .risk import RiskManager
+from .selector import MarketRanker, clip_size
 from .strategy import EntryDecision, SpreadStrategy
 from .volatility import VolatilityTracker
 from .venues.base import ExecutionVenue, OrderRequest
@@ -109,8 +110,19 @@ class Engine:
         hedge_exec: ExecutionVenue,
         maker_specs: Dict[str, MarketSpec],
         hedge_specs: Dict[str, MarketSpec],
+        maker_rest: Optional[LighterRest] = None,
+        hedge_rest: Optional[LighterRest] = None,
+        universe: Optional[List[str]] = None,
+        volumes: Optional[Dict[str, float]] = None,
+        marks: Optional[Dict[str, Decimal]] = None,
     ) -> None:
         self.cfg = cfg
+        self.maker_rest = maker_rest
+        self.hedge_rest = hedge_rest
+        # Everything tradable on both venues, for rotation to choose from.
+        self.universe = universe or [m.symbol for m in cfg.markets]
+        self.volumes = volumes or {}
+        self.marks = marks or {}
         self.maker_feed = maker_feed
         self.hedge_feed = hedge_feed
         self.maker_exec = maker_exec
@@ -132,6 +144,8 @@ class Engine:
         }
         self._stop = asyncio.Event()
         self._last_reconcile = 0.0
+        self._last_rotation = 0.0
+        self._last_funding = 0.0
         # Extra resources (REST sessions) to release on shutdown.
         self.closeables: List[object] = []
 
@@ -207,7 +221,24 @@ class Engine:
             await self._reconcile_positions()
             self._last_reconcile = now
 
-        for symbol, state in self.states.items():
+        if self.cfg.funding.enabled and now - self._last_funding > self.cfg.funding.refresh_seconds:
+            self._last_funding = now
+            await self._refresh_funding()
+
+        if (
+            self.cfg.rotation.enabled
+            and self.maker_rest is not None
+            and now - self._last_rotation > self.cfg.rotation.interval_seconds
+        ):
+            self._last_rotation = now
+            try:
+                await self._rotate_markets()
+            except Exception as exc:
+                log.exception("rotation failed")
+                self.risk.note_error(f"rotation: {exc}")
+
+        # The rotation above can add and remove markets, so iterate a snapshot.
+        for symbol, state in list(self.states.items()):
             try:
                 await self._tick_market(symbol, state, now)
             except Exception as exc:
@@ -782,6 +813,145 @@ class Engine:
                     pair.short_entry = (book.mid if book else ZERO) or ZERO
                 pair.short_size = venue_short
 
+    # -------------------------------------------------------------- rotation
+
+    def _is_pinned(self, state: MarketState) -> bool:
+        """A market we cannot walk away from right now."""
+        if not state.pair.is_flat:
+            return True
+        return any(
+            order is not None and not order.is_terminal
+            for order in (state.quote_order, state.exit_order, state.bounce_order)
+        )
+
+    async def _rotate_markets(self) -> None:
+        """Move the watched set toward wherever the gaps currently are."""
+        cfg = self.cfg.rotation
+        ranker = MarketRanker(gap=self.cfg.gap)
+        universe = [
+            symbol
+            for symbol in self.universe
+            if cfg.min_volume_usd <= Decimal(str(self.volumes.get(symbol, 0.0))) <= cfg.max_volume_usd
+        ]
+        if not universe:
+            log.warning("rotation: no market passes the volume filter")
+            return
+
+        for symbol in universe:
+            try:
+                bids, asks = await self.maker_rest.order_book_levels(
+                    self.maker_specs[symbol].market_id, limit=self.cfg.feed.depth_levels * 5
+                )
+            except Exception:
+                continue
+            book = OrderBook("scan", symbol)
+            book.apply_snapshot(bids, asks)
+            ranker.observe(book, self.maker_specs[symbol], volume_usd=self.volumes.get(symbol, 0.0))
+            if cfg.scan_delay_ms:
+                await asyncio.sleep(cfg.scan_delay_ms / 1_000)
+
+        pinned = [s for s, st in self.states.items() if self._is_pinned(st)]
+        ranked = [s for s in ranker.top_symbols(cfg.watch * 3) if s not in pinned]
+        room = max(0, cfg.watch - len(pinned))
+
+        # Limit churn so a single noisy scan cannot swap the whole book out.
+        current = [s for s in self.cfg.symbols if s not in pinned]
+        keep = [s for s in current if s in ranked][: max(0, room - cfg.max_churn)]
+        picks = pinned + keep
+        for symbol in ranked:
+            if len(picks) >= cfg.watch:
+                break
+            if symbol not in picks:
+                picks.append(symbol)
+
+        if set(picks) == set(self.cfg.symbols):
+            log.info("rotation: watched set unchanged (%d markets)", len(picks))
+            return
+
+        markets: List[MarketConfig] = []
+        for symbol in picks:
+            try:
+                existing = self.cfg.market(symbol)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                markets.append(existing)
+                continue
+            spec = self.maker_specs[symbol]
+            mark = self.marks.get(symbol)
+            size = clip_size(spec, mark, cfg.clip_usd) if mark else None
+            if size is None:
+                continue
+            markets.append(
+                MarketConfig(
+                    symbol=symbol,
+                    order_base=size,
+                    max_position_base=spec.quantize_size(size * 2),
+                )
+            )
+        if not markets:
+            return
+
+        added = sorted({m.symbol for m in markets} - set(self.cfg.symbols))
+        dropped = sorted(set(self.cfg.symbols) - {m.symbol for m in markets})
+
+        # Anything being dropped must leave nothing behind on the venue. Our own
+        # order references are cleared first, but the authority is cancel_all on
+        # the market itself: once we stop watching a market, nothing will ever
+        # come back to cancel an order we lost track of.
+        for symbol in dropped:
+            state = self.states.get(symbol)
+            if state is not None:
+                await self._cancel_quote(state, "rotated out")
+                await self._cancel_exit(state, "rotated out")
+                await self._cancel_bounce(state, "rotated out")
+            for venue in (self.maker_exec, self.hedge_exec):
+                try:
+                    await venue.cancel_all(symbol)
+                except Exception as exc:
+                    # Never rotate away from a market we could not clear.
+                    log.error("%s: could not clear %s before rotating out: %s", venue.venue_key, symbol, exc)
+                    self.risk.note_error(f"rotation: {symbol} not cleared on {venue.venue_key}")
+                    return
+
+        self.cfg.set_markets(markets)
+        symbols = [m.symbol for m in markets]
+        await self.maker_feed.resubscribe(symbols)
+        await self.hedge_feed.resubscribe(symbols)
+
+        for symbol in dropped:
+            self.states.pop(symbol, None)
+        for symbol in symbols:
+            self.states.setdefault(
+                symbol,
+                MarketState(
+                    symbol,
+                    PairPosition(symbol, self.cfg.maker_venue.key, self.cfg.hedge_venue.key),
+                    vol=VolatilityTracker(window_seconds=float(self.cfg.hedge.vol_window_seconds)),
+                ),
+            )
+        log.info(
+            "rotation: +%s -%s (watching %d)",
+            ",".join(added) or "-",
+            ",".join(dropped) or "-",
+            len(symbols),
+        )
+
+    async def _refresh_funding(self) -> None:
+        if not self.cfg.funding.enabled or self.maker_rest is None:
+            return
+        try:
+            maker = await self.maker_rest.funding_rates()
+            hedge = (
+                maker
+                if self.hedge_rest is self.maker_rest
+                else await self.hedge_rest.funding_rates()
+            )
+        except Exception as exc:
+            log.warning("funding refresh failed: %s", exc)
+            return
+        self.strategy.set_funding(maker, hedge)
+
     def _open_notional(self) -> Decimal:
         """Capital committed: filled longs *plus* everything currently resting.
 
@@ -880,6 +1050,21 @@ async def build_engine(cfg: Config) -> "Engine":
     await maker_exec.start()
     await hedge_exec.start()
 
+    # Rotation needs to know what else it could be watching.
+    universe = sorted(set(maker_specs) & set(hedge_specs))
+    volumes: Dict[str, float] = {}
+    marks: Dict[str, Decimal] = {}
+    if cfg.rotation.enabled:
+        try:
+            details = (await maker_rest._get("orderBookDetails"))["order_book_details"]
+            volumes = {
+                str(d["symbol"]).upper(): float(d.get("daily_quote_token_volume") or 0)
+                for d in details
+            }
+            marks = await maker_rest.mark_prices()
+        except Exception as exc:
+            log.warning("could not load the rotation universe (%s); staying on configured markets", exc)
+
     engine = Engine(
         cfg,
         maker_feed=maker_feed,
@@ -888,6 +1073,11 @@ async def build_engine(cfg: Config) -> "Engine":
         hedge_exec=hedge_exec,
         maker_specs=maker_specs,
         hedge_specs=hedge_specs,
+        maker_rest=maker_rest,
+        hedge_rest=hedge_rest,
+        universe=universe,
+        volumes=volumes,
+        marks=marks,
     )
     engine.closeables.extend([maker_rest, hedge_rest])
     return engine

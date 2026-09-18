@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .book import OrderBook
 from .config import Config
@@ -70,6 +70,34 @@ class ExitPlan:
 class SpreadStrategy:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        # Hourly funding rates as fractions of notional, per venue, keyed by
+        # symbol. Positive means longs pay. Refreshed by the engine.
+        self.maker_funding: Dict[str, Decimal] = {}
+        self.hedge_funding: Dict[str, Decimal] = {}
+
+    # ---------------------------------------------------------------- funding
+
+    def set_funding(self, maker: Dict[str, Decimal], hedge: Dict[str, Decimal]) -> None:
+        self.maker_funding = maker
+        self.hedge_funding = hedge
+
+    def funding_cost_bps(self, symbol: str, *, hold_hours: Optional[Decimal] = None) -> Decimal:
+        """Net funding we expect to pay over the hold, in bps of notional.
+
+        Long on the maker venue, short on the hedge venue: we pay the maker
+        venue's rate and receive the hedge venue's, so only the difference
+        matters. Positive means it costs us.
+        """
+        cfg = self.cfg.funding
+        if not cfg.enabled:
+            return ZERO
+        maker_rate = self.maker_funding.get(symbol)
+        hedge_rate = self.hedge_funding.get(symbol)
+        if maker_rate is None and hedge_rate is None:
+            return ZERO
+        net_hourly = (maker_rate or ZERO) - (hedge_rate or ZERO)
+        hours = cfg.expected_hold_hours if hold_hours is None else hold_hours
+        return net_hourly * hours * BPS
 
     # ------------------------------------------------------------------- edge
 
@@ -171,6 +199,18 @@ class SpreadStrategy:
 
         threshold = self.min_entry_bps(symbol)
         delayed = self.cfg.hedge.is_delayed
+
+        # Funding is charged on the position, not on the trade, so it comes off
+        # every candidate equally - and on a hot token it can exceed the whole
+        # edge on its own, in which case there is nothing to look for here.
+        funding_bps = self.funding_cost_bps(symbol)
+        if funding_bps > self.cfg.funding.max_cost_bps:
+            return EntryDecision(
+                None,
+                f"funding costs {funding_bps:.2f}bps over the expected hold, "
+                f"limit {self.cfg.funding.max_cost_bps}bps",
+            )
+
         best_edge: Optional[Decimal] = None
         blocked: Optional[str] = None
         for candidate in candidates:
@@ -186,7 +226,7 @@ class SpreadStrategy:
                 self.bounce_edge_bps(candidate.price, target, maker_spec)
                 if delayed
                 else self.entry_edge_bps(candidate.price, hedge_price, maker_spec, hedge_spec)
-            )
+            ) - funding_bps
             if best_edge is None or edge > best_edge:
                 best_edge = edge
             if edge < threshold:

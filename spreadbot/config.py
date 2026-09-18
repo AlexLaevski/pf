@@ -308,6 +308,80 @@ class BounceConfig:
 
 
 @dataclass(frozen=True)
+class RotationConfig:
+    """Rotate the watched markets toward wherever the gaps currently are.
+
+    Time in market is what binds this strategy: a quote can only be hit while
+    it is resting, and a given market offers somewhere to rest only while its
+    book has a hole. Watching a fixed handful means sitting out most of the
+    day. Rotation trades a periodic scan for being in the book far more often.
+    """
+
+    enabled: bool = False
+    interval_seconds: int = 900
+    watch: int = 12
+    max_churn: int = 4                     # markets swapped per round, to limit thrash
+    clip_usd: Decimal = Decimal(50)
+    min_volume_usd: Decimal = Decimal(50_000)
+    max_volume_usd: Decimal = Decimal(500_000_000)
+    scan_delay_ms: int = 120               # spacing between book requests while scanning
+
+    @classmethod
+    def parse(cls, data: Dict[str, Any]) -> "RotationConfig":
+        d = data or {}
+        cfg = cls(
+            enabled=bool(d.get("enabled", False)),
+            interval_seconds=int(d.get("interval_seconds", 900)),
+            watch=int(d.get("watch", 12)),
+            max_churn=int(d.get("max_churn", 4)),
+            clip_usd=_dec(d.get("clip_usd", 50), "rotation.clip_usd"),
+            min_volume_usd=_dec(d.get("min_volume_usd", 50_000), "rotation.min_volume_usd"),
+            max_volume_usd=_dec(d.get("max_volume_usd", 500_000_000), "rotation.max_volume_usd"),
+            scan_delay_ms=int(d.get("scan_delay_ms", 120)),
+        )
+        if cfg.watch < 1:
+            raise ConfigError("rotation.watch must be >= 1")
+        if cfg.clip_usd <= 0:
+            raise ConfigError("rotation.clip_usd must be > 0")
+        return cfg
+
+
+@dataclass(frozen=True)
+class FundingConfig:
+    """Funding is a real cost and on some markets it is the whole edge.
+
+    We are long on the maker venue and short on the hedge venue, so funding
+    nets: we pay the maker venue's rate and receive the hedge venue's. On a
+    single hot token the two can be far apart, and at 6 bps/hour a fifteen
+    minute hold quietly eats 1.5 bps of a 10 bps trade.
+    """
+
+    enabled: bool = True
+    expected_hold_minutes: Decimal = Decimal(10)
+    max_cost_bps: Decimal = Decimal(5)
+    refresh_seconds: int = 300
+
+    @property
+    def expected_hold_hours(self) -> Decimal:
+        return self.expected_hold_minutes / Decimal(60)
+
+    @classmethod
+    def parse(cls, data: Dict[str, Any]) -> "FundingConfig":
+        d = data or {}
+        cfg = cls(
+            enabled=bool(d.get("enabled", True)),
+            expected_hold_minutes=_dec(
+                d.get("expected_hold_minutes", 10), "funding.expected_hold_minutes"
+            ),
+            max_cost_bps=_dec(d.get("max_cost_bps", 5), "funding.max_cost_bps"),
+            refresh_seconds=int(d.get("refresh_seconds", 300)),
+        )
+        if cfg.expected_hold_minutes < 0:
+            raise ConfigError("funding.expected_hold_minutes must be >= 0")
+        return cfg
+
+
+@dataclass(frozen=True)
 class RiskConfig:
     max_open_notional_usd: Decimal = Decimal(5_000)
     max_unhedged_notional_usd: Decimal = Decimal(250)
@@ -393,6 +467,8 @@ class Config:
     edge: EdgeConfig = field(default_factory=EdgeConfig)
     hedge: HedgeConfig = field(default_factory=HedgeConfig)
     bounce: BounceConfig = field(default_factory=BounceConfig)
+    funding: FundingConfig = field(default_factory=FundingConfig)
+    rotation: RotationConfig = field(default_factory=RotationConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     unwind: UnwindConfig = field(default_factory=UnwindConfig)
     log_level: str = "INFO"
@@ -410,6 +486,19 @@ class Config:
             if market.symbol == symbol:
                 return market
         raise KeyError(symbol)
+
+    @property
+    def symbols(self) -> List[str]:
+        return [market.symbol for market in self.markets]
+
+    def set_markets(self, markets: List[MarketConfig]) -> None:
+        """Replace the watched market set at runtime (used by rotation).
+
+        The list object is mutated in place rather than rebound, so the
+        strategy and anything else holding this config sees the new set
+        immediately and there is only ever one source of truth.
+        """
+        self.markets[:] = markets
 
 
 def load_config(path: str | Path) -> Config:
@@ -474,6 +563,8 @@ def parse_config(raw: Dict[str, Any]) -> Config:
         edge=EdgeConfig.parse(raw.get("edge") or {}),
         hedge=HedgeConfig.parse(raw.get("hedge") or {}),
         bounce=BounceConfig.parse(raw.get("bounce") or {}),
+        funding=FundingConfig.parse(raw.get("funding") or {}),
+        rotation=RotationConfig.parse(raw.get("rotation") or {}),
         risk=RiskConfig.parse(raw.get("risk") or {}),
         unwind=UnwindConfig.parse(raw.get("unwind") or {}),
         log_level=str(raw.get("log_level", "INFO")).upper(),

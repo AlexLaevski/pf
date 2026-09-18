@@ -1,0 +1,43 @@
+[Unit]
+Description=Lighter spread bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=spreadbot
+Group=spreadbot
+WorkingDirectory=/opt/spreadbot
+
+# The API key lives here and nowhere else. chmod 600, owned by root, never in
+# the repository and never in shell history.
+EnvironmentFile=/etc/spreadbot.env
+
+ExecStart=/opt/spreadbot/.venv/bin/spreadbot run -c /opt/spreadbot/config/config.yaml --yes
+
+# A trading bot that dies must come back, but a bot that crash-loops into an
+# exchange is worse than one that stays down: back off hard between restarts.
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Give the process a chance to cancel its resting orders before it is killed.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# State, logs and the kill switch file are the only writable paths.
+ReadWritePaths=/var/lib/spreadbot /var/log/spreadbot
+
+StandardOutput=append:/var/log/spreadbot/spreadbot.log
+StandardError=append:/var/log/spreadbot/spreadbot.log
+
+[Install]
+WantedBy=multi-user.target

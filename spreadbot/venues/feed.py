@@ -94,6 +94,37 @@ class LighterFeed:
         self._stop.clear()
         self._task = asyncio.create_task(self._run(), name=f"feed-{self.venue_key}")
 
+    async def resubscribe(self, symbols: Sequence[str]) -> None:
+        """Swap the watched set at runtime.
+
+        Books for symbols that stay are kept as they are — dropping and
+        refetching them would blind the strategy for a poll cycle on markets it
+        is actively quoting. The WebSocket is reconnected rather than sent an
+        unsubscribe, because a reconnect is a path that is exercised constantly
+        and known to resync cleanly.
+        """
+        wanted = {s.upper() for s in symbols}
+        unknown = wanted - set(self.specs)
+        if unknown:
+            raise KeyError(f"{self.venue_key}: markets not listed here: {sorted(unknown)}")
+        if wanted == set(self.books):
+            return
+
+        for symbol in set(self.books) - wanted:
+            self.books.pop(symbol, None)
+        for symbol in wanted - set(self.books):
+            self.books[symbol] = OrderBook(self.venue_key, symbol)
+        self._by_market_id = {
+            self.specs[symbol].market_id: symbol for symbol in self.books
+        }
+        log.info("%s: now watching %d markets", self.venue_key, len(self.books))
+
+        if self.transport == "ws" and self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = asyncio.create_task(self._run(), name=f"feed-{self.venue_key}")
+
     async def close(self) -> None:
         self._stop.set()
         if self._task is not None:
@@ -293,6 +324,13 @@ class StaticFeed:
     async def start(self, symbols: Sequence[str]) -> None:
         for symbol in symbols:
             self.books[symbol.upper()] = OrderBook(self.venue_key, symbol.upper())
+
+    async def resubscribe(self, symbols: Sequence[str]) -> None:
+        wanted = {s.upper() for s in symbols}
+        for symbol in set(self.books) - wanted:
+            self.books.pop(symbol, None)
+        for symbol in wanted - set(self.books):
+            self.books[symbol] = OrderBook(self.venue_key, symbol)
 
     async def close(self) -> None:
         self._connected = False
