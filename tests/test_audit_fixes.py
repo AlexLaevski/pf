@@ -292,3 +292,107 @@ def test_kill_switch_halt_is_not_sticky_once_the_file_is_gone(tmp_path):
     switch.unlink()
     risk.resume()
     assert not risk.halted
+
+
+# --- audit #3: a vanished order must be settled at once --------------------
+
+
+class _FakeOrder:
+    def __init__(self, coi, filled, quote, order_index=7):
+        self.client_order_index = coi
+        self.filled_base_amount = str(filled)
+        self.filled_quote_amount = str(quote)
+        self.order_index = order_index
+        self.remaining_base_amount = "0"
+        self.price = "99.6"
+
+
+class _FakeOrders:
+    def __init__(self, orders):
+        self.orders = orders
+
+
+class _FakeOrderApi:
+    """Mimics Lighter: a filled order leaves active and appears in inactive."""
+
+    def __init__(self, active, inactive):
+        self._active, self._inactive = active, inactive
+        self.inactive_calls = 0
+
+    async def account_active_orders(self, **kwargs):
+        return _FakeOrders(self._active)
+
+    async def account_inactive_orders(self, **kwargs):
+        self.inactive_calls += 1
+        return _FakeOrders(self._inactive)
+
+
+def _live_venue(active, inactive):
+    from spreadbot.config import VenueConfig
+    from spreadbot.models import Side as _Side
+    from spreadbot.venues.live import LighterExecution
+
+    cfg = VenueConfig(
+        key="rh",
+        name="rh",
+        base_url="https://example.invalid",
+        ws_url="wss://example.invalid/stream",
+        allowed_side=_Side.BUY,
+        account_index=1,
+    )
+    venue = LighterExecution(cfg, {"BTC": spec("BTC")}, rest=None)
+    venue._order_api = _FakeOrderApi(active, inactive)
+
+    async def _auth():
+        return "token"
+
+    venue._auth = _auth
+    return venue
+
+
+async def test_an_order_that_left_the_active_list_is_settled_immediately():
+    from spreadbot.models import Order, OrderType
+
+    venue = _live_venue(active=[], inactive=[_FakeOrder(42, "0.01", "0.996")])
+    order = Order(
+        venue="rh",
+        symbol="BTC",
+        side=Side.BUY,
+        price=D("99.6"),
+        size=D("0.01"),
+        order_type=OrderType.POST_ONLY,
+        client_order_index=42,
+    )
+    order.status = __import__("spreadbot.models", fromlist=["OrderStatus"]).OrderStatus.OPEN
+    venue.open_orders[42] = order
+
+    fills = await venue.sync_orders("BTC")
+
+    # Before the fix this waited for the 5s reconciliation sweep, which is
+    # 5 seconds of naked exposure on every single entry.
+    assert venue._order_api.inactive_calls == 1
+    assert len(fills) == 1
+    assert fills[0].size == D("0.01")
+    assert fills[0].price == D("99.6")
+    assert not venue.fills.empty(), "the engine reads fills off the queue"
+
+
+async def test_a_vanished_order_that_never_filled_is_not_invented_as_a_fill():
+    from spreadbot.models import Order, OrderStatus, OrderType
+
+    venue = _live_venue(active=[], inactive=[_FakeOrder(42, "0", "0")])
+    order = Order(
+        venue="rh",
+        symbol="BTC",
+        side=Side.BUY,
+        price=D("99.6"),
+        size=D("0.01"),
+        order_type=OrderType.POST_ONLY,
+        client_order_index=42,
+    )
+    order.status = OrderStatus.OPEN
+    venue.open_orders[42] = order
+
+    assert await venue.sync_orders("BTC") == []
+    assert venue.fills.empty()
+    assert order.status is OrderStatus.CANCELED
