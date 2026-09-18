@@ -1,0 +1,100 @@
+# Lighter spread bot - example configuration.
+#
+# Copy to config/config.yaml and edit. Secrets stay out of this file: a venue
+# names an environment variable and the key is read from the environment.
+#
+#   cp config/config.example.yaml config/config.yaml
+#   export LIGHTER_CORE_PRIVATE_KEY=0x...
+#   export LIGHTER_RH_PRIVATE_KEY=0x...
+#   spreadbot validate -c config/config.yaml
+
+mode: paper          # paper = simulated fills on live data | live = real orders
+log_level: INFO
+
+venues:
+  # Lighter on Robinhood. LONG ONLY - this is the venue we buy into.
+  #
+  # Set base_url to that deployment's API host. It is a separate Lighter
+  # domain from Core with its own order book and its own account index, and
+  # the URL is not the Core one. Check it with:
+  #     spreadbot markets --url <base_url>
+  # `ws_url` defaults to the base URL with wss:// and /stream appended.
+  lighter_rh:
+    name: Lighter on Robinhood
+    base_url: https://REPLACE-WITH-ROBINHOOD-LIGHTER-API-HOST
+    # ws_url: wss://REPLACE-WITH-ROBINHOOD-LIGHTER-API-HOST/stream
+    allowed_side: buy
+    account_index: 0
+    api_key_index: 0
+    private_key_env: LIGHTER_RH_PRIVATE_KEY
+    # Override the published fee schedule if your account has a different one.
+    # maker_fee_bps: 0
+    # taker_fee_bps: 2
+
+  # Lighter Core. SHORT ONLY - this is the venue we hedge on.
+  lighter_core:
+    name: Lighter Core
+    base_url: https://mainnet.zklighter.elliot.ai
+    ws_url: wss://mainnet.zklighter.elliot.ai/stream
+    allowed_side: sell
+    account_index: 0
+    api_key_index: 0
+    private_key_env: LIGHTER_CORE_PRIVATE_KEY
+
+roles:
+  maker: lighter_rh      # where the passive limit order rests (long)
+  hedge: lighter_core    # where the fill is hedged (short)
+
+feed:
+  transport: ws          # ws | rest (polling fallback)
+  rest_poll_ms: 400
+  depth_levels: 50
+  staleness_ms: 3000     # a book older than this is not tradable
+
+markets:
+  - symbol: BTC
+    order_base: 0.001          # size of one clip, in base units
+    max_position_base: 0.005   # never hold more long than this
+  - symbol: ETH
+    order_base: 0.02
+    max_position_base: 0.10
+    # min_entry_bps: 4         # per-market override
+
+# Where to rest the quote: in front of the first dense level.
+gap:
+  wall_notional_usd: 20000     # a level counts as a wall from this notional up
+  wall_multiple: 4             # ...and at least this many times a typical level
+  min_gap_bps: 1.5             # the hole above the wall must be this wide
+  min_gap_ticks: 2             # ...and this many ticks
+  min_wall_levels: 1           # walls may be a cluster of N consecutive levels
+  join_offset_ticks: 1         # how far in front of the wall we sit
+  max_levels_scan: 40
+  max_distance_from_mid_bps: 50  # never quote further than this from mid
+  # Fill-probability dial: a sweep has to clear everything resting at better
+  # prices before it reaches us. Leave unset to ignore queue depth (and mostly
+  # sit unfilled on a deep book); set it to the size of sweep you expect.
+  # max_ahead_notional_usd: 50000
+
+# When the trade is worth doing.
+edge:
+  min_entry_bps: 3.0           # net of fees, after the buffer below
+  extra_buffer_bps: 0.5
+  exit_bps: 0.5                # unwind once the reverse spread closes to here
+  requote_ticks: 1             # reprice when the target moves this far
+  requote_size_tol: 0.25
+  hedge_is_taker: true
+
+risk:
+  max_open_notional_usd: 2000
+  max_unhedged_notional_usd: 250   # naked exposure allowed while hedging
+  unhedged_timeout_ms: 2000        # ...and for how long
+  max_hedge_slippage_bps: 8
+  max_daily_loss_usd: 200
+  max_consecutive_errors: 5
+  # Create this file to stop the bot from opening anything new.
+  kill_switch_file: ./HALT
+
+unwind:
+  max_hold_seconds: 900        # force-close a pair older than this
+  stop_loss_bps: 30
+  passive_exit: true           # try a maker exit before taking

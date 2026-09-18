@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lighter-spread-bot"
+version = "0.1.0"
+description = "Cross-venue spread bot for Lighter Core and Lighter on Robinhood: passive maker quotes into thin order books, hedged on the opposite venue."
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "websockets>=12.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+# Only needed for live trading. Market data and paper trading work without it.
+live = ["lighter-sdk>=0.1.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+spreadbot = "spreadbot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["spreadbot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
