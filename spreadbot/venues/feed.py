@@ -235,13 +235,20 @@ class LighterFeed:
                     continue
                 book.apply_snapshot(bids, asks)
 
-            if throttled:
-                # Back off the whole loop, not just this request: the limit is
-                # per client, so retrying market by market only digs deeper.
+            # A whole cycle failing means the venue is refusing us, not that one
+            # market is odd: rate limiting, a bot challenge, an outage. Spinning
+            # at full rate against any of those only makes it worse.
+            everything_failed = bool(self.books) and len(failures) == len(self.books)
+            if throttled or everything_failed:
                 interval = min(REST_MAX_INTERVAL_SECONDS, max(interval, base_interval) * 2)
                 log.warning(
-                    "%s: rate limited, slowing book polling to %.1fs", self.venue_key, interval
+                    "%s: %s, slowing book polling to %.1fs",
+                    self.venue_key,
+                    "rate limited" if throttled else f"all {len(failures)} polls failed",
+                    interval,
                 )
+                if everything_failed and failures:
+                    log.warning("%s: first failure was %s", self.venue_key, failures[0])
             else:
                 if failures:
                     # One line per cycle rather than one per market.

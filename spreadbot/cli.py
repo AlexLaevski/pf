@@ -27,10 +27,14 @@ from .book import OrderBook
 from .config import ConfigError, FeedConfig, GapConfig, load_config
 from .gaps import book_thinness_bps, find_wall_candidates
 from .logging_setup import setup_logging
+from .measure import MeasureConfig, Recorder
 from .models import Side
+from .report import format_summary, load_rows, per_symbol, summarise
+from .selector import MarketRanker, clip_size
 from .strategy import SpreadStrategy
 from .venues.feed import LighterFeed
 from .venues.rest import LighterRest
+from .volatility import VolatilityTracker
 
 log = logging.getLogger("spreadbot.cli")
 
@@ -206,6 +210,166 @@ async def cmd_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_rank(args: argparse.Namespace) -> int:
+    """Score every active market by how often it offers a place to rest a quote."""
+    gap_cfg = GapConfig(
+        wall_notional_usd=Decimal(str(args.wall_usd)),
+        wall_multiple=Decimal(str(args.wall_multiple)),
+        min_gap_bps=Decimal(str(args.min_gap_bps)),
+        min_gap_ticks=args.min_gap_ticks,
+        max_distance_from_mid_bps=Decimal(str(args.max_distance_bps)),
+        max_ahead_notional_usd=(
+            Decimal(str(args.max_ahead_usd)) if args.max_ahead_usd is not None else None
+        ),
+    )
+    ranker = MarketRanker(gap=gap_cfg)
+    async with LighterRest(args.url) as rest:
+        specs = await rest.market_specs()
+        details = (await rest._get("orderBookDetails"))["order_book_details"]
+        volume = {d["symbol"]: float(d.get("daily_quote_token_volume") or 0) for d in details}
+        marks = await rest.mark_prices()
+        universe = [
+            s for s in specs if args.min_volume <= volume.get(s, 0.0) <= args.max_volume
+        ]
+        print(f"скан {len(universe)} рынков x {args.passes} проход(ов)...", file=sys.stderr)
+
+        for pass_no in range(args.passes):
+            for symbol in universe:
+                try:
+                    bids, asks = await rest.order_book_levels(
+                        specs[symbol].market_id, limit=args.depth
+                    )
+                except Exception as exc:
+                    log.debug("%s: %s", symbol, exc)
+                    continue
+                book = OrderBook("scan", symbol)
+                book.apply_snapshot(bids, asks)
+                ranker.observe(book, specs[symbol], volume_usd=volume.get(symbol, 0.0))
+            if pass_no + 1 < args.passes:
+                await asyncio.sleep(args.pass_interval)
+
+        rows = ranker.ranked()
+        print(
+            f"\n{'symbol':<11}{'score':>8}{'доля':>8}{'эдж bps':>10}{'от мида':>9}"
+            f"{'spread':>8}{'глуб $':>11}{'vol $/сут':>13}"
+        )
+        for row in rows[: args.top]:
+            print(
+                f"{row.symbol:<11}{row.score:>8.1f}{row.hit_rate * 100:>7.0f}%"
+                f"{row.avg_edge_bps:>10.1f}{row.avg_distance_bps:>9.1f}"
+                f"{row.avg_spread_bps:>8.1f}{row.avg_depth_usd:>11,.0f}{row.volume_usd:>13,.0f}"
+            )
+        print(f"\n{len(rows)} рынков с хотя бы одной дыркой из {len(universe)} просканированных")
+
+        if args.emit_config:
+            print("\n# --- вставить в config.yaml ---\nmarkets:")
+            for row in rows[: args.top]:
+                spec, price = specs[row.symbol], marks.get(row.symbol)
+                if price is None:
+                    continue
+                size = clip_size(spec, price, Decimal(str(args.clip_usd)))
+                if size is None:
+                    continue
+                print(
+                    f"  - symbol: {row.symbol}\n"
+                    f"    order_base: {size}\n"
+                    f"    max_position_base: {spec.quantize_size(size * 2)}"
+                )
+    return 0
+
+
+async def cmd_measure(args: argparse.Namespace) -> int:
+    """Record what the bot would have done, without placing a single order."""
+    cfg = load_config(args.config)
+    setup_logging(cfg.log_level, args.logfile)
+    symbols = [m.symbol for m in cfg.markets]
+    strategy = SpreadStrategy(cfg)
+
+    maker_rest, maker_specs, maker_feed = await _feed_for(
+        cfg.maker_venue.base_url, symbols, transport=cfg.feed.transport, venue_key=cfg.maker_venue.key
+    )
+    hedge_rest, hedge_specs, hedge_feed = await _feed_for(
+        cfg.hedge_venue.base_url, symbols, transport=cfg.feed.transport, venue_key=cfg.hedge_venue.key
+    )
+    trackers = {s: VolatilityTracker(window_seconds=float(cfg.hedge.vol_window_seconds)) for s in symbols}
+    sink = open(args.out, "a") if args.out else None
+    recorder = Recorder(
+        cfg,
+        strategy,
+        maker_specs,
+        hedge_specs,
+        measure=MeasureConfig(
+            horizon_seconds=args.horizon,
+            max_rest_seconds=args.max_rest,
+        ),
+        sink=sink,
+    )
+    try:
+        if not (await maker_feed.wait_ready(30) and await hedge_feed.wait_ready(30)):
+            print("стаканы не пришли", file=sys.stderr)
+            return 1
+        log.info(
+            "измерение %d рынков на %.0f мин, горизонт отслеживания %.0fs",
+            len(symbols),
+            args.duration / 60,
+            args.horizon,
+        )
+        deadline = time.time() + args.duration
+        while time.time() < deadline:
+            now = time.time()
+            for symbol in symbols:
+                maker_book = maker_feed.books.get(symbol)
+                hedge_book = hedge_feed.books.get(symbol)
+                if maker_book is None or hedge_book is None:
+                    continue
+                trackers[symbol].update(now, maker_book.mid)
+                if not (maker_feed.is_fresh(symbol) and hedge_feed.is_fresh(symbol)):
+                    continue
+                recorder.tick(
+                    symbol,
+                    maker_book,
+                    hedge_book,
+                    now=now,
+                    vol_bps_per_min=trackers[symbol].bps_per_minute(),
+                )
+            await maker_feed.wait_for_update(0.2)
+        recorder.finish()
+    finally:
+        if sink is not None:
+            sink.close()
+        for closer in (maker_feed, hedge_feed, maker_rest, hedge_rest):
+            with contextlib.suppress(Exception):
+                await closer.close()
+
+    print("\n" + format_summary(summarise(recorder.rows), clip_usd=args.clip_usd))
+    if args.out:
+        print(f"\nсырые строки: {args.out}")
+    return 0
+
+
+async def cmd_report(args: argparse.Namespace) -> int:
+    rows = load_rows(args.path)
+    if not rows:
+        print("в логе нет строк", file=sys.stderr)
+        return 1
+    print(format_summary(summarise(rows), clip_usd=args.clip_usd))
+    if args.by_symbol:
+        print(f"\n{'symbol':<12}{'котир':>7}{'филлов':>8}{'отскок':>8}{'эдж факт':>10}")
+        for symbol, summary in sorted(
+            per_symbol(rows).items(),
+            key=lambda kv: kv[1].mean_realised_bps or -1e9,
+            reverse=True,
+        ):
+            realised = (
+                f"{summary.mean_realised_bps:+.1f}" if summary.mean_realised_bps is not None else "-"
+            )
+            print(
+                f"{symbol:<12}{summary.quotes:>7}{summary.fills:>8}"
+                f"{summary.bounces:>8}{realised:>10}"
+            )
+    return 0
+
+
 async def cmd_run(args: argparse.Namespace) -> int:
     from .engine import build_engine
 
@@ -320,6 +484,43 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--duration", type=float, default=60.0)
     p_scan.add_argument("--once", action="store_true")
     p_scan.set_defaults(func=cmd_scan)
+
+    p_rank = sub.add_parser("rank", help="score every market by how gappy its book is")
+    p_rank.add_argument("--url", required=True)
+    p_rank.add_argument("--top", type=int, default=30)
+    p_rank.add_argument("--passes", type=int, default=3, help="book snapshots per market")
+    p_rank.add_argument("--pass-interval", type=float, default=20.0)
+    p_rank.add_argument("--depth", type=int, default=250)
+    p_rank.add_argument("--wall-usd", type=float, default=10_000)
+    p_rank.add_argument("--wall-multiple", type=float, default=3.0)
+    p_rank.add_argument("--min-gap-bps", type=float, default=15.0)
+    p_rank.add_argument("--min-gap-ticks", type=int, default=2)
+    p_rank.add_argument("--max-distance-bps", type=float, default=150.0)
+    p_rank.add_argument("--max-ahead-usd", type=float, default=60_000)
+    p_rank.add_argument("--min-volume", type=float, default=50_000)
+    p_rank.add_argument("--max-volume", type=float, default=5e8)
+    p_rank.add_argument("--clip-usd", type=float, default=50.0)
+    p_rank.add_argument(
+        "--emit-config", action="store_true", help="print a ready markets: block"
+    )
+    p_rank.set_defaults(func=cmd_rank)
+
+    p_measure = sub.add_parser(
+        "measure", help="record would-be quotes and their outcomes, placing no orders"
+    )
+    p_measure.add_argument("-c", "--config", required=True)
+    p_measure.add_argument("--duration", type=float, default=3_600.0, help="seconds to watch")
+    p_measure.add_argument("--horizon", type=float, default=60.0, help="seconds tracked after a fill")
+    p_measure.add_argument("--max-rest", type=float, default=600.0)
+    p_measure.add_argument("--clip-usd", type=float, default=50.0)
+    p_measure.add_argument("--out", default=None, help="append JSONL rows here")
+    p_measure.set_defaults(func=cmd_measure)
+
+    p_report = sub.add_parser("report", help="summarise a measurement log")
+    p_report.add_argument("path")
+    p_report.add_argument("--clip-usd", type=float, default=50.0)
+    p_report.add_argument("--by-symbol", action="store_true")
+    p_report.set_defaults(func=cmd_report)
 
     p_run = sub.add_parser("run", help="run the bot")
     p_run.add_argument("-c", "--config", required=True)
