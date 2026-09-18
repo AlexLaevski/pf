@@ -2,9 +2,10 @@
 
 Fill model, stated plainly so results are read with the right amount of salt:
 
-* A resting buy fills when the public best bid trades at or below its price —
-  i.e. the book was swept through our level. That is optimistic: in reality a
-  sweep that stops exactly at our price leaves us behind the queue.
+* A resting buy fills when the public best bid drops strictly below its price —
+  i.e. the book was swept through our level. A sweep that stops exactly at our
+  price does not count, because in reality it would have to clear the queue
+  already resting there first.
 * A resting sell is the mirror image.
 * IOC/market orders fill at the book VWAP for their size and are rejected when
   that VWAP is worse than ``max_slippage_bps`` from the touch.
@@ -120,10 +121,13 @@ class PaperExecution(ExecutionVenue):
             book = self.feed.books.get(order.symbol)
             if book is None or not book.ready:
                 continue
+            # The book has to trade *through* our price, not merely reach it:
+            # an order resting at the touch shares the level with everyone else
+            # already queued there, so equality is not a fill.
             touched = (
-                book.best_bid is not None and book.best_bid <= order.price
+                book.best_bid is not None and book.best_bid < order.price
                 if order.side is Side.BUY
-                else book.best_ask is not None and book.best_ask >= order.price
+                else book.best_ask is not None and book.best_ask > order.price
             )
             if not touched:
                 continue

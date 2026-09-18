@@ -157,6 +157,96 @@ def test_passive_exit_price_sits_in_front_of_an_ask_wall():
     assert strat.passive_exit_price(pair, maker_book, spec()) == D("100.5")
 
 
+def _wall():
+    from spreadbot.gaps import find_wall_candidates
+    from spreadbot.models import Side
+
+    ob = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
+    return find_wall_candidates(ob, Side.BUY, spec(), parse_config(raw_config()).gap)[0]
+
+
+def test_bounce_target_aims_at_the_top_of_the_hole():
+    strat = strategy(hedge={"mode": "delayed"}, bounce={"target": "hole_top"})
+    candidate = _wall()
+    assert candidate.near_price == D("99.8")
+    assert strat.bounce_target_price(candidate.price, candidate, spec()) == D("99.8")
+
+
+def test_bounce_target_respects_the_minimum_markup():
+    # A hole top only a hair above the entry gets pushed up to the floor.
+    strat = strategy(hedge={"mode": "delayed"}, bounce={"target": "hole_top", "min_target_bps": 100})
+    candidate = _wall()
+    target = strat.bounce_target_price(candidate.price, candidate, spec())
+    assert target > candidate.near_price
+    assert target >= candidate.price * D("1.01")
+
+
+def test_bounce_target_fixed_bps_mode():
+    strat = strategy(hedge={"mode": "delayed"}, bounce={"target": "fixed_bps", "target_bps": 50})
+    candidate = _wall()
+    target = strat.bounce_target_price(D(100), candidate, spec())
+    assert target == D("100.5")
+
+
+def test_bounce_edge_charges_the_maker_fee_twice():
+    strat = strategy(hedge={"mode": "delayed"})
+    plain = strat.bounce_edge_bps(D(100), D("100.5"), spec())
+    with_fee = strat.bounce_edge_bps(D(100), D("100.5"), spec(maker_fee_bps="1"))
+    assert plain == D(50)
+    assert D(47) < with_fee < D(49)
+
+
+def test_delayed_mode_enters_on_the_bounce_not_the_hedge_price():
+    strat = strategy(hedge={"mode": "delayed"}, bounce={"target": "hole_top"})
+    maker_book = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
+    # Hedge venue is BELOW our quote: in immediate mode this would be refused.
+    hedge_book = book([("99.55", "10")], [("99.60", "10")], venue="core")
+    decision = strat.plan_entry(
+        "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
+    )
+    assert decision.ok, decision.reason
+    assert decision.plan.bounce_target == D("99.8")
+    assert decision.plan.edge_bps > D(19)     # 99.6 -> 99.8 is ~20bps
+
+
+def test_delayed_mode_still_refuses_when_the_hedge_cannot_absorb_the_clip():
+    strat = strategy(hedge={"mode": "delayed"})
+    maker_book = book(MAKER_BIDS, MAKER_ASKS, venue="rh")
+    hedge_book = book([("100.0", "0.0001")], [("100.05", "1")], venue="core")
+    decision = strat.plan_entry(
+        "BTC", maker_book, hedge_book, spec(), spec(), capacity_base=D("0.05")
+    )
+    assert not decision.ok
+    assert "too thin" in decision.reason
+
+
+def test_panic_trigger_only_fires_past_the_threshold():
+    strat = strategy(hedge={"mode": "delayed", "panic_bps": 50})
+    assert strat.should_panic_hedge(D(100), D("99.9")) is None      # 10bps against
+    assert strat.should_panic_hedge(D(100), D("99.5")) == D(50)     # exactly at
+    assert strat.should_panic_hedge(D(100), D(99)) == D(100)
+
+
+def test_panic_trigger_is_inert_in_immediate_mode():
+    strat = strategy(hedge={"mode": "immediate"})
+    assert strat.should_panic_hedge(D(100), D(90)) is None
+
+
+def test_naked_window_scales_with_volatility():
+    strat = strategy(
+        hedge={
+            "mode": "delayed",
+            "base_seconds": 30,
+            "min_seconds": 10,
+            "max_seconds": 30,
+            "reference_vol_bps_per_min": 25,
+        }
+    )
+    assert strat.naked_window_seconds(25.0) == 30.0
+    assert strat.naked_window_seconds(75.0) == 10.0
+    assert strat.naked_window_seconds(None) == 10.0
+
+
 def test_min_entry_bps_can_be_overridden_per_market():
     strat = strategy(
         markets=[

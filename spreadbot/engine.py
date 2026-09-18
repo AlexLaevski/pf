@@ -29,6 +29,7 @@ from .models import (
     Fill,
     MarketSpec,
     Order,
+    OrderStatus,
     OrderType,
     PairPosition,
     Quote,
@@ -36,6 +37,7 @@ from .models import (
 )
 from .risk import RiskManager
 from .strategy import EntryDecision, SpreadStrategy
+from .volatility import VolatilityTracker
 from .venues.base import ExecutionVenue, OrderRequest
 from .venues.feed import LighterFeed
 from .venues.paper import PaperExecution
@@ -58,6 +60,16 @@ class MarketState:
     last_reason: str = ""
     entries: int = 0
     exits: int = 0
+    # Delayed-hedge (scalp) mode only.
+    vol: VolatilityTracker = field(default_factory=VolatilityTracker)
+    planned_bounce_target: Optional[Decimal] = None   # computed when the quote went out
+    bounce_order: Optional[Order] = None              # take-profit resting while naked
+    naked_since: Optional[float] = None
+    naked_window: float = 0.0
+
+    def clear_naked(self) -> None:
+        self.naked_since = None
+        self.naked_window = 0.0
 
 
 @dataclass
@@ -69,6 +81,8 @@ class EngineStats:
     hedges: int = 0
     hedge_failures: int = 0
     exits: int = 0
+    bounces_won: int = 0        # closed on the bounce, hedge never needed
+    panic_hedges: int = 0       # bailed early because the price ran away
 
     def as_dict(self) -> Dict[str, float]:
         return {
@@ -76,7 +90,9 @@ class EngineStats:
             "quotes_placed": self.quotes_placed,
             "quotes_cancelled": self.quotes_cancelled,
             "entries_filled": self.entries_filled,
+            "bounces_won": self.bounces_won,
             "hedges": self.hedges,
+            "panic_hedges": self.panic_hedges,
             "hedge_failures": self.hedge_failures,
             "exits": self.exits,
         }
@@ -110,6 +126,7 @@ class Engine:
             market.symbol: MarketState(
                 market.symbol,
                 PairPosition(market.symbol, cfg.maker_venue.key, cfg.hedge_venue.key),
+                vol=VolatilityTracker(window_seconds=float(cfg.hedge.vol_window_seconds)),
             )
             for market in cfg.markets
         }
@@ -212,11 +229,24 @@ class Engine:
             return
 
         mark = hedge_book.mid or maker_book.mid or ZERO
+        state.vol.update(now, maker_book.mid)
 
-        # 1. Naked exposure is the only real emergency.
+        # 1. Unhedged exposure. In immediate mode this is an emergency and the
+        # hedge fires now. In delayed mode it is the trade: we hold the naked
+        # long for a volatility-scaled window, hoping the sweep reverts, and
+        # only hedge when that window closes or the price runs away from us.
         if state.pair.unhedged > ZERO:
-            await self._hedge(state, hedge_book, mark, now)
+            if self.cfg.hedge.is_delayed and state.pair.short_size <= ZERO:
+                await self._manage_naked(state, maker_book, hedge_book, mark, now)
+            else:
+                await self._hedge(state, hedge_book, mark, now, reason="unhedged fill")
             return
+
+        # The scalp is over: either the bounce closed it or the hedge landed.
+        if state.naked_since is not None and state.pair.long_size <= ZERO:
+            await self._finish_bounce(state)
+        if state.pair.long_size <= ZERO:
+            state.clear_naked()
 
         self.risk.clear_unhedged(symbol)
 
@@ -260,9 +290,152 @@ class Engine:
             log.info("%s: flat, realised %.4f USD", pair.symbol, pair.realized_pnl)
             pair.realized_pnl = ZERO
 
+    # ---------------------------------------------------- naked window (scalp)
+
+    async def _manage_naked(
+        self,
+        state: MarketState,
+        maker_book: OrderBook,
+        hedge_book: OrderBook,
+        mark: Decimal,
+        now: float,
+    ) -> None:
+        """Hold the unhedged long while the bounce still has a chance."""
+        pair = state.pair
+        maker_spec = self.maker_specs[pair.symbol]
+        size = pair.unhedged
+
+        if state.naked_since is None:
+            vol = state.vol.bps_per_minute()
+            state.naked_since = now
+            state.naked_window = self.strategy.naked_window_seconds(vol)
+            log.info(
+                "%s: naked long %s @ %s | vol %s bps/min -> window %.1fs",
+                pair.symbol,
+                pair.long_size,
+                pair.long_entry,
+                f"{vol:.1f}" if vol is not None else "unknown",
+                state.naked_window,
+            )
+
+        await self._rest_bounce_order(state, maker_spec)
+
+        # What we could hedge at right now decides both the bail-out and the
+        # bookkeeping, so it is worth the walk down the book.
+        quote = hedge_book.executable_vwap(Side.SELL, size)
+        hedge_price = quote[0] if quote else (hedge_book.best_bid or mark)
+        adverse = self.strategy.adverse_bps(pair.long_entry, hedge_price)
+        elapsed = now - state.naked_since
+
+        panic = self.strategy.should_panic_hedge(pair.long_entry, hedge_price)
+        if panic is not None:
+            self.stats.panic_hedges += 1
+            await self._cancel_bounce(state, "panic hedge")
+            await self._hedge(
+                state, hedge_book, mark, now, reason=f"price ran {panic:.1f}bps against us"
+            )
+            return
+
+        # The notional ceiling is absolute and applies in either mode; the time
+        # limit in delayed mode is the volatility window, not risk.unhedged_timeout_ms.
+        notional_breach = self.risk.unhedged_notional_breach(pair, mark)
+        if notional_breach is not None:
+            await self._cancel_bounce(state, "unhedged notional over limit")
+            await self._hedge(state, hedge_book, mark, now, reason=notional_breach)
+            return
+
+        if elapsed >= state.naked_window:
+            await self._cancel_bounce(state, "bounce window expired")
+            await self._hedge(
+                state,
+                hedge_book,
+                mark,
+                now,
+                reason=f"no bounce in {elapsed:.1f}s (window {state.naked_window:.1f}s)",
+            )
+            return
+
+        state.last_reason = (
+            f"waiting for bounce {elapsed:.1f}/{state.naked_window:.1f}s, "
+            f"{adverse:+.1f}bps vs entry"
+        )
+
+    async def _rest_bounce_order(self, state: MarketState, maker_spec: MarketSpec) -> None:
+        """Keep the take-profit resting above the entry while we are naked."""
+        pair = state.pair
+        if state.bounce_order is not None and not state.bounce_order.is_terminal:
+            return
+        target = state.planned_bounce_target
+        if target is None or target <= pair.long_entry:
+            return
+        size = maker_spec.quantize_size(pair.long_size)
+        if size <= ZERO or size < maker_spec.min_base_amount:
+            return
+        try:
+            order = await self.maker_exec.place(
+                OrderRequest(
+                    symbol=pair.symbol,
+                    side=Side.SELL,
+                    size=size,
+                    price=target,
+                    order_type=OrderType.POST_ONLY,
+                    reduce_only=True,
+                    tag="bounce",
+                )
+            )
+        except Exception as exc:
+            self.risk.note_error(f"{pair.symbol}: bounce order placement failed: {exc}")
+            return
+        if order.status is OrderStatus.REJECTED:
+            log.debug("%s: bounce order rejected (%s)", pair.symbol, order.error)
+            self.maker_exec.forget(order)
+            return
+        state.bounce_order = order
+        log.info(
+            "%s: bounce take-profit %s @ %s (entry %s)",
+            pair.symbol,
+            size,
+            target,
+            pair.long_entry,
+        )
+
+    async def _cancel_bounce(self, state: MarketState, reason: str) -> None:
+        if state.bounce_order is None:
+            return
+        order = state.bounce_order
+        state.bounce_order = None
+        with contextlib.suppress(Exception):
+            await self.maker_exec.cancel(order)
+        self.maker_exec.forget(order)
+        log.debug("%s: cancelled bounce order (%s)", state.symbol, reason)
+
+    async def _finish_bounce(self, state: MarketState) -> None:
+        """The take-profit filled before the window closed: a clean scalp."""
+        pair = state.pair
+        await self._cancel_bounce(state, "bounce complete")
+        self.stats.bounces_won += 1
+        state.exits += 1
+        self.risk.book_pnl(pair.realized_pnl)
+        log.info(
+            "%s: BOUNCE won in %.1fs, realised %.4f USD (hedge never needed)",
+            pair.symbol,
+            (time.time() - state.naked_since) if state.naked_since else 0.0,
+            pair.realized_pnl,
+        )
+        pair.realized_pnl = ZERO
+        state.clear_naked()
+
     # ----------------------------------------------------------------- hedge
 
-    async def _hedge(self, state: MarketState, hedge_book: OrderBook, mark: Decimal, now: float) -> None:
+    async def _hedge(
+        self,
+        state: MarketState,
+        hedge_book: OrderBook,
+        mark: Decimal,
+        now: float,
+        *,
+        reason: str = "",
+    ) -> None:
         pair = state.pair
         size = pair.unhedged
         breach = self.risk.unhedged_breach(pair, mark, now=now)
@@ -272,9 +445,24 @@ class Engine:
             pair.symbol,
             size,
             self.hedge_exec.venue_key,
-            f" ({breach})" if breach else "",
+            f" ({reason or breach})" if (reason or breach) else "",
         )
-        result = await self.hedger.execute(pair.symbol, Side.SELL, size, hedge_book, tag="hedge")
+        state.clear_naked()
+        hedge_cfg = self.cfg.hedge
+        if hedge_cfg.maker_first:
+            result = await self.hedger.execute_maker_first(
+                pair.symbol,
+                Side.SELL,
+                size,
+                hedge_book,
+                timeout_ms=hedge_cfg.maker_timeout_ms,
+                offset_ticks=hedge_cfg.maker_offset_ticks,
+                tag="hedge",
+            )
+        else:
+            result = await self.hedger.execute(
+                pair.symbol, Side.SELL, size, hedge_book, tag="hedge"
+            )
         # Positions move in exactly one place: _apply_fill, off the fill queue.
         # The taker result only drives control flow.
         self._drain_fills(self.hedge_exec)
@@ -455,6 +643,9 @@ class Engine:
 
         state.quote_order = order
         state.quote = plan.quote
+        # Captured now, while the hole is still visible: after the sweep that
+        # fills us, the level we are aiming back at no longer exists in the book.
+        state.planned_bounce_target = plan.bounce_target
         self.stats.quotes_placed += 1
         self.risk.note_ok()
         log.info(
@@ -522,9 +713,11 @@ class Engine:
                     state.quote = None
             else:
                 pair.reduce_long(fill.price, fill.size)
-                if state.exit_order is not None and state.exit_order.remaining <= ZERO:
-                    self.maker_exec.forget(state.exit_order)
-                    state.exit_order = None
+                for attr in ("exit_order", "bounce_order"):
+                    order = getattr(state, attr)
+                    if order is not None and order.remaining <= ZERO:
+                        self.maker_exec.forget(order)
+                        setattr(state, attr, None)
         elif fill.venue == self.hedge_exec.venue_key:
             if fill.side is Side.SELL:
                 pair.add_short(fill.price, fill.size)

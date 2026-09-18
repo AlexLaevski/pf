@@ -39,6 +39,7 @@ class WallCandidate:
     side: Side
     price: Decimal              # where we would quote
     wall_price: Decimal         # first price of the dense region
+    near_price: Decimal         # the level on the touch side of the hole - where a sweep came from
     wall_notional: Decimal      # USD resting in the wall cluster
     hole_ticks: Decimal         # empty price steps between the wall and the level above it
     hole_bps: Decimal           # same, as bps of mid
@@ -164,6 +165,7 @@ def find_wall_candidates(
                 side=side,
                 price=price,
                 wall_price=wall_price,
+                near_price=near_price,
                 wall_notional=cluster_notional,
                 hole_ticks=hole_ticks,
                 hole_bps=hole_bps,

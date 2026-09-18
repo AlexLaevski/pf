@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -108,6 +109,47 @@ async def test_hedger_reports_failure_when_the_book_cannot_absorb_it():
     result = await hedger.execute("BTC", Side.SELL, D("1"), feed.book("BTC"))
     assert not result.ok
     assert result.error
+
+
+async def test_maker_first_hedge_falls_back_to_taking():
+    venue, feed = make_venue(Side.SELL)
+    hedger = Hedger(venue, max_slippage_bps=D(50), retry_delay=0)
+    # Posting at the touch does not fill in the paper model, so the ladder has
+    # to time out and take. 50ms keeps the test quick.
+    result = await hedger.execute_maker_first(
+        "BTC", Side.SELL, D("0.5"), feed.book("BTC"), timeout_ms=50
+    )
+    assert result.ok
+    assert result.filled == D("0.5")
+    assert result.price == D("100.0")      # took the bid, not the posted ask
+
+
+async def test_maker_first_hedge_fills_passively_when_the_book_moves():
+    venue, feed = make_venue(Side.SELL)
+    hedger = Hedger(venue, max_slippage_bps=D(50), retry_delay=0)
+
+    async def lift_the_book():
+        await asyncio.sleep(0.02)
+        feed.set_book("BTC", [("100.2", "5")], [("100.3", "5")])
+
+    lifter = asyncio.create_task(lift_the_book())
+    result = await hedger.execute_maker_first(
+        "BTC", Side.SELL, D("0.5"), feed.book("BTC"), timeout_ms=400
+    )
+    await lifter
+    assert result.ok
+    assert result.price == D("100.1")      # our posted ask, saving the spread
+    assert result.attempts == 1
+
+
+async def test_maker_first_never_leaves_the_hedge_pending():
+    venue, feed = make_venue(Side.SELL)
+    hedger = Hedger(venue, max_slippage_bps=D(50), retry_delay=0)
+    result = await hedger.execute_maker_first(
+        "BTC", Side.SELL, D("0.5"), feed.book("BTC"), timeout_ms=30
+    )
+    assert result.filled == D("0.5")
+    assert venue.resting("BTC") == {}, "the unfilled maker leg must be cancelled"
 
 
 async def test_cancel_all_clears_resting_orders():

@@ -114,6 +114,25 @@ class RiskManager:
             )
         return True, "ok"
 
+    def unhedged_notional_breach(self, pair: PairPosition, mark: Decimal) -> Optional[str]:
+        """The size half of the unhedged limit, without the clock.
+
+        Delayed-hedge mode deliberately sits unhedged for seconds at a time, so
+        the time limit there is the volatility window rather than
+        ``unhedged_timeout_ms``. The notional ceiling still applies, and this is
+        how that half is checked on its own.
+        """
+        unhedged = pair.unhedged
+        if unhedged <= ZERO:
+            return None
+        notional = unhedged * mark
+        if notional > self.cfg.max_unhedged_notional_usd:
+            return (
+                f"unhedged {unhedged} ({notional:.0f} USD) over limit "
+                f"{self.cfg.max_unhedged_notional_usd}"
+            )
+        return None
+
     def unhedged_breach(
         self, pair: PairPosition, mark: Decimal, *, now: Optional[float] = None
     ) -> Optional[str]:

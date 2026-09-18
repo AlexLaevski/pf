@@ -212,6 +212,102 @@ class EdgeConfig:
 
 
 @dataclass(frozen=True)
+class HedgeConfig:
+    """When the hedge leg fires, and how hard it pushes.
+
+    ``immediate`` hedges the moment the maker leg fills — delta-neutral from
+    the first millisecond, capturing only the cross-venue spread.
+
+    ``delayed`` is the scalp: after a gap fill the bot sits in the naked long
+    for a volatility-scaled window, hoping the sweep mean-reverts and the
+    bounce exit fills for a much bigger gain. The hedge is the fallback when
+    the bounce does not come.
+
+    In ``delayed`` mode ``panic_bps`` is what keeps the naked window bounded:
+    the timer only runs while the trade is roughly where we left it. Once the
+    hedge-able price has fallen that far below our entry, the window is over
+    regardless of how much time is left.
+    """
+
+    mode: str = "immediate"
+    base_seconds: Decimal = Decimal(30)
+    min_seconds: Decimal = Decimal(8)
+    max_seconds: Decimal = Decimal(45)
+    reference_vol_bps_per_min: Decimal = Decimal(25)
+    vol_window_seconds: Decimal = Decimal(180)
+    panic_bps: Decimal = Decimal(50)
+    maker_first: bool = False
+    maker_timeout_ms: int = 1_200
+    maker_offset_ticks: int = 0
+
+    @property
+    def is_delayed(self) -> bool:
+        return self.mode == "delayed"
+
+    @classmethod
+    def parse(cls, data: Dict[str, Any]) -> "HedgeConfig":
+        d = data or {}
+        mode = str(d.get("mode", "immediate")).lower()
+        if mode not in ("immediate", "delayed"):
+            raise ConfigError("hedge.mode must be 'immediate' or 'delayed'")
+        cfg = cls(
+            mode=mode,
+            base_seconds=_dec(d.get("base_seconds", 30), "hedge.base_seconds"),
+            min_seconds=_dec(d.get("min_seconds", 8), "hedge.min_seconds"),
+            max_seconds=_dec(d.get("max_seconds", 45), "hedge.max_seconds"),
+            reference_vol_bps_per_min=_dec(
+                d.get("reference_vol_bps_per_min", 25), "hedge.reference_vol_bps_per_min"
+            ),
+            vol_window_seconds=_dec(d.get("vol_window_seconds", 180), "hedge.vol_window_seconds"),
+            panic_bps=_dec(d.get("panic_bps", 50), "hedge.panic_bps"),
+            # Maker-first is the natural pairing for the delayed hedge, where a
+            # second of queue time is cheap. In immediate mode the whole point
+            # is to lock the spread at once, so there it stays off by default.
+            maker_first=bool(d.get("maker_first", mode == "delayed")),
+            maker_timeout_ms=int(d.get("maker_timeout_ms", 1_200)),
+            maker_offset_ticks=int(d.get("maker_offset_ticks", 0)),
+        )
+        if cfg.min_seconds > cfg.max_seconds:
+            raise ConfigError("hedge.min_seconds must not exceed hedge.max_seconds")
+        if cfg.min_seconds < 0:
+            raise ConfigError("hedge.min_seconds must be >= 0")
+        if cfg.reference_vol_bps_per_min <= 0:
+            raise ConfigError("hedge.reference_vol_bps_per_min must be > 0")
+        if cfg.is_delayed and cfg.panic_bps <= 0:
+            raise ConfigError(
+                "hedge.panic_bps must be > 0 in delayed mode: it is the only bound "
+                "on how far the naked leg can run against you"
+            )
+        return cfg
+
+
+@dataclass(frozen=True)
+class BounceConfig:
+    """Where the take-profit sits while we hold the naked long.
+
+    ``hole_top`` aims back at the near edge of the gap we were filled through —
+    that is the level the sweep came from, so it is the natural target for a
+    mean reversion. ``fixed_bps`` is a flat markup over the entry instead.
+    """
+
+    target: str = "hole_top"
+    target_bps: Decimal = Decimal(20)
+    min_target_bps: Decimal = Decimal(3)
+
+    @classmethod
+    def parse(cls, data: Dict[str, Any]) -> "BounceConfig":
+        d = data or {}
+        target = str(d.get("target", "hole_top")).lower()
+        if target not in ("hole_top", "fixed_bps"):
+            raise ConfigError("bounce.target must be 'hole_top' or 'fixed_bps'")
+        return cls(
+            target=target,
+            target_bps=_dec(d.get("target_bps", 20), "bounce.target_bps"),
+            min_target_bps=_dec(d.get("min_target_bps", 3), "bounce.min_target_bps"),
+        )
+
+
+@dataclass(frozen=True)
 class RiskConfig:
     max_open_notional_usd: Decimal = Decimal(5_000)
     max_unhedged_notional_usd: Decimal = Decimal(250)
@@ -295,6 +391,8 @@ class Config:
     feed: FeedConfig = field(default_factory=FeedConfig)
     gap: GapConfig = field(default_factory=GapConfig)
     edge: EdgeConfig = field(default_factory=EdgeConfig)
+    hedge: HedgeConfig = field(default_factory=HedgeConfig)
+    bounce: BounceConfig = field(default_factory=BounceConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     unwind: UnwindConfig = field(default_factory=UnwindConfig)
     log_level: str = "INFO"
@@ -374,6 +472,8 @@ def parse_config(raw: Dict[str, Any]) -> Config:
         feed=FeedConfig.parse(raw.get("feed") or {}),
         gap=GapConfig.parse(raw.get("gap") or {}),
         edge=EdgeConfig.parse(raw.get("edge") or {}),
+        hedge=HedgeConfig.parse(raw.get("hedge") or {}),
+        bounce=BounceConfig.parse(raw.get("bounce") or {}),
         risk=RiskConfig.parse(raw.get("risk") or {}),
         unwind=UnwindConfig.parse(raw.get("unwind") or {}),
         log_level=str(raw.get("log_level", "INFO")).upper(),

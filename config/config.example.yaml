@@ -76,6 +76,11 @@ gap:
   # max_ahead_notional_usd: 50000
 
 # When the trade is worth doing.
+#
+# The bar means different things in the two hedge modes below:
+#   immediate -> the cross-venue spread, net of both venues' fees
+#   delayed   -> the size of the bounce back up the hole, net of the maker fee
+#                charged on both legs of the round trip
 edge:
   min_entry_bps: 3.0           # net of fees, after the buffer below
   extra_buffer_bps: 0.5
@@ -84,10 +89,58 @@ edge:
   requote_size_tol: 0.25
   hedge_is_taker: true
 
+# WHEN the hedge fires. This is the biggest single choice in the config.
+#
+#   immediate -- hedge the instant the maker leg fills. Delta-neutral from the
+#                first millisecond; earns only the cross-venue spread. Safe.
+#
+#   delayed   -- the scalp. After the fill the bot sits in a NAKED long for a
+#                volatility-scaled window, hoping the sweep mean-reverts into
+#                the take-profit below. The hedge is the fallback when it does
+#                not. Earns much more per trade and carries real directional
+#                risk while the window runs.
+hedge:
+  mode: immediate              # immediate | delayed
+
+  # --- delayed mode only ---------------------------------------------------
+  # Window length = base_seconds x (reference_vol / measured_vol), clamped.
+  # So a calm token gets the long end, a jumpy one the short end.
+  base_seconds: 30             # window at exactly the reference volatility
+  min_seconds: 10              # ...never shorter than this
+  max_seconds: 30              # ...never longer than this
+  reference_vol_bps_per_min: 25
+  vol_window_seconds: 180      # how much history the vol estimate looks at
+
+  # The hard bound on the naked window. If the price we could hedge at has
+  # fallen this far below our entry, the window ends NOW, whatever the clock
+  # says. Without this the timer alone is unbounded risk - on a thin, fast
+  # token 10 seconds is easily 1-2%.
+  panic_bps: 50
+
+  # Try to hedge as a maker first, then take whatever has not filled. Defaults
+  # to true in delayed mode (a second of queue time is cheap there) and false
+  # in immediate mode (where the point is to lock the spread at once).
+  # maker_first: true
+  maker_timeout_ms: 1200       # then cancel and take the rest
+  maker_offset_ticks: 0        # 0 = join the touch
+
+# Where the take-profit sits while we hold the naked long (delayed mode only).
+bounce:
+  target: hole_top             # hole_top | fixed_bps
+  # hole_top aims back at the near edge of the gap we were filled through -
+  # the level the sweep came from, and so where a reversion goes back to.
+  target_bps: 20               # used when target: fixed_bps
+  min_target_bps: 3            # floor, so a narrow hole cannot collapse onto the entry
+
 risk:
   max_open_notional_usd: 2000
-  max_unhedged_notional_usd: 250   # naked exposure allowed while hedging
-  unhedged_timeout_ms: 2000        # ...and for how long
+  # Hard ceiling on naked exposure. Applies in BOTH modes and overrides the
+  # bounce window: if the unhedged clip is worth more than this, it is hedged
+  # immediately no matter how much time is left on the clock.
+  max_unhedged_notional_usd: 250
+  # Time limit on naked exposure in immediate mode. In delayed mode the time
+  # limit is the volatility window under `hedge:` instead, and this is unused.
+  unhedged_timeout_ms: 2000
   max_hedge_slippage_bps: 8
   max_daily_loss_usd: 200
   max_consecutive_errors: 5
